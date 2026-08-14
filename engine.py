@@ -1,4 +1,5 @@
 import re
+import datetime
 import pandas as pd
 
 # =====================================================================================
@@ -16,12 +17,33 @@ import pandas as pd
 
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]  # index 0 = Monday
 
+# Booking tags sometimes get scraped into the station name (not real stations).
+_BOOKING_TAG_RE = re.compile(r"\s*\((?:PQ|RL)\)\s*", re.IGNORECASE)
+
+
+def clean_station_name(name: str) -> str:
+    """
+    Strip scraped booking tags like (PQ)/(RL) and tidy whitespace.
+    'Jodhpur Jn (PQ)' -> 'Jodhpur Jn'
+    """
+    if name is None:
+        return ""
+    s = str(name).strip()
+    # Remove tags repeatedly in case of odd spacing
+    while True:
+        cleaned = _BOOKING_TAG_RE.sub(" ", s)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned == s:
+            break
+        s = cleaned
+    return s
+
 
 def normalize_name(name: str) -> str:
     """Uppercase + collapse whitespace so station names from different files can be matched."""
     if name is None:
         return ""
-    return re.sub(r"\s+", " ", str(name).strip().upper())
+    return re.sub(r"\s+", " ", clean_station_name(name).upper())
 
 
 def _load_stations():
@@ -29,7 +51,7 @@ def _load_stations():
     stations_df = pd.read_csv("stations.csv", dtype=str)
     stations_df.columns = [c.strip() for c in stations_df.columns]
     stations_df["station_code"] = stations_df["station_code"].fillna("").str.strip().str.upper()
-    stations_df["station_name"] = stations_df["station_name"].fillna("").str.strip()
+    stations_df["station_name"] = stations_df["station_name"].fillna("").str.strip().map(clean_station_name)
     stations_df["norm_name"] = stations_df["station_name"].apply(normalize_name)
 
     # Keep first code seen per normalized name (in case of duplicate rows).
@@ -58,7 +80,7 @@ def _make_fallback_code(name: str) -> str:
     stable code for it so trains stopping at the "same" unmatched station can still
     be recognised as a valid interchange point.
     """
-    base = re.sub(r"[^A-Z]", "", name.upper())[:4] or "STN"
+    base = re.sub(r"[^A-Z]", "", normalize_name(name))[:4] or "STN"
     code = base
     i = 1
     while code in _USED_CODES:
@@ -68,16 +90,74 @@ def _make_fallback_code(name: str) -> str:
     return code
 
 
+def _lookup_code_by_name(station_name: str) -> str:
+    """Match cleaned/normalized name against the master station list."""
+    norm = normalize_name(station_name)
+    if not norm:
+        return ""
+    code = NAME_TO_CODE.get(norm, "")
+    if code:
+        return code
+    # Light fuzzy: treat JN / JUNCTION the same
+    alt = norm.replace(" JUNCTION", " JN").replace(" JN.", " JN")
+    if alt != norm:
+        code = NAME_TO_CODE.get(alt, "")
+        if code:
+            return code
+    return ""
+
+
 def _resolve_station_code(row):
+    """
+    Prefer the official code from stations.csv (by cleaned name).
+    Only keep a scraped code if we cannot match the name.
+    """
+    cleaned_name = clean_station_name(row.get("station_name") or "")
+    by_name = _lookup_code_by_name(cleaned_name)
+    if by_name:
+        return by_name
+
     existing = (row.get("station_code") or "").strip().upper()
+    if existing and existing in CODE_TO_NAME:
+        return existing
     if existing:
         return existing
-    norm = normalize_name(row["station_name"])
-    if norm in NAME_TO_CODE and NAME_TO_CODE[norm]:
-        return NAME_TO_CODE[norm]
+
+    norm = normalize_name(cleaned_name)
     if norm not in _FALLBACK_CACHE:
-        _FALLBACK_CACHE[norm] = _make_fallback_code(row["station_name"])
+        _FALLBACK_CACHE[norm] = _make_fallback_code(cleaned_name or "STN")
     return _FALLBACK_CACHE[norm]
+
+
+def _display_station_name(code: str, fallback_name: str = "") -> str:
+    """One clean display name per station code (prefer stations.csv)."""
+    official = CODE_TO_NAME.get(code, "")
+    name = clean_station_name(official or fallback_name)
+    return name
+
+
+def _build_station_list(schedule_df) -> list:
+    """
+    One dropdown entry per station code.
+    Avoids duplicates from casing / (PQ) / (RL) name variants.
+    """
+    best = {}  # code -> display name
+    for code, name in zip(schedule_df["station_code"], schedule_df["station_name"]):
+        code = (code or "").strip().upper()
+        if not code:
+            continue
+        display = _display_station_name(code, name)
+        if not display:
+            continue
+        # Prefer official master name when available
+        if code not in best or code in CODE_TO_NAME:
+            best[code] = _display_station_name(code, display)
+
+    return sorted(
+        f"{name} ({code})"
+        for code, name in best.items()
+        if name and code
+    )
 
 
 def _load_schedule():
@@ -90,12 +170,18 @@ def _load_schedule():
         df[col] = df[col].fillna("")
 
     df["train_number"] = df["train_number"].str.strip()
-    df["station_name"] = df["station_name"].str.strip()
+    # Clean names first so (PQ)/(RL)/casing variants map to the same station
+    df["station_name"] = df["station_name"].map(clean_station_name)
     df["arrival"] = df["arrival"].replace("", "00:00:00")
     df["departure"] = df["departure"].replace("", "00:00:00")
 
     # Resolve/repair station codes (many rows arrive with a blank station_code).
     df["station_code"] = df.apply(_resolve_station_code, axis=1)
+    # Canonical display name from master list when possible
+    df["station_name"] = [
+        _display_station_name(code, name)
+        for code, name in zip(df["station_code"], df["station_name"])
+    ]
 
     df["day"] = pd.to_numeric(df["day"], errors="coerce").fillna(1).astype(int)
     df["stop_seq"] = df.groupby("train_number").cumcount()
@@ -132,10 +218,8 @@ _running_days_df = _load_running_days()
 RUNNING_DAYS_MAP = dict(zip(_running_days_df["train_number"], _running_days_df["running_days"]))
 TRAIN_META = _running_days_df.set_index("train_number")[["train_name", "source", "destination"]].to_dict("index")
 
-# Dropdown list: "STATION NAME (CODE)"
-raw_stations = (df2["station_name"] + " (" + df2["station_code"] + ")").dropna()
-station_list = sorted(set(s for s in raw_stations if s.strip() and "()" not in s))
-
+# Dropdown list: one entry per station code — "STATION NAME (CODE)"
+station_list = _build_station_list(df2)
 # Searchable index of trains: (train_number, train_name) for the "lookup by train number" feature.
 _first_rows = df2.drop_duplicates(subset="train_number")[["train_number", "train_name"]]
 TRAIN_INDEX = sorted(
@@ -173,6 +257,26 @@ def train_runs_on(train_number: str, weekday_idx: int) -> bool:
     if not code:
         return True
     return code[weekday_idx % 7] == "1"
+
+
+def origin_weekday_for_boarding(boarding_weekday: int, schedule_day: int) -> int:
+    """
+    Running-days apply to the train's ORIGIN departure day.
+
+    schedule_day is the CSV journey day at the boarding station (1 = origin day).
+    Example: train leaves Chennai Sat (origin), Badnera is day 2 → boarding Sun
+    means origin weekday = Sun - 1 = Sat.
+    """
+    offset = max(int(schedule_day or 1) - 1, 0)
+    return (int(boarding_weekday) - offset) % 7
+
+
+def train_runs_on_boarding_date(train_number: str, boarding_date, schedule_day: int) -> bool:
+    """True if boarding on boarding_date at a stop on schedule_day is valid."""
+    if boarding_date is None:
+        return True
+    origin_wd = origin_weekday_for_boarding(boarding_date.weekday(), schedule_day)
+    return train_runs_on(train_number, origin_wd)
 
 
 # =====================================================================================
@@ -269,7 +373,7 @@ def find_connections_pro(
 ):
     # 1. LEG 1 (start -> mid)
     starts = df2[df2["station_code"] == start_code][
-        ["train_number", "stop_seq", "abs_departure", "departure", "train_name"]
+        ["train_number", "stop_seq", "abs_departure", "departure", "train_name", "day"]
     ]
     starts = starts.rename(
         columns={
@@ -277,6 +381,7 @@ def find_connections_pro(
             "abs_departure": "abs_start_dep",
             "departure": "start_time",
             "train_name": "train1_name",
+            "day": "train1_start_day",
         }
     )
 
@@ -291,7 +396,17 @@ def find_connections_pro(
     leg1 = leg1[leg1["t1_duration_hrs"] > 0]
 
     leg1 = leg1[
-        ["train_number", "train1_name", "station_code", "station_name", "start_time", "arrival", "t1_duration_hrs"]
+        [
+            "train_number",
+            "train1_name",
+            "station_code",
+            "station_name",
+            "start_time",
+            "arrival",
+            "t1_duration_hrs",
+            "train1_start_day",
+            "day",
+        ]
     ]
     leg1 = leg1.rename(
         columns={
@@ -299,6 +414,7 @@ def find_connections_pro(
             "arrival": "arr_at_c",
             "station_code": "station_c",
             "start_time": "dep_from_a",
+            "day": "train1_mid_day",
         }
     )
 
@@ -325,13 +441,16 @@ def find_connections_pro(
     leg2["t2_duration_hrs"] = (leg2["abs_end_arr"] - leg2["abs_departure"]).dt.total_seconds() / 3600
     leg2 = leg2[leg2["t2_duration_hrs"] > 0]
 
-    leg2 = leg2[["train_number", "train2_name", "station_code", "departure", "end_time", "t2_duration_hrs"]]
+    leg2 = leg2[
+        ["train_number", "train2_name", "station_code", "departure", "end_time", "t2_duration_hrs", "day"]
+    ]
     leg2 = leg2.rename(
         columns={
             "train_number": "train2",
             "departure": "dep_from_c",
             "station_code": "station_c",
             "end_time": "arr_at_b",
+            "day": "train2_mid_day",
         }
     )
 
@@ -377,21 +496,34 @@ def find_connections_pro(
         if valid_routes.empty:
             return pd.DataFrame()
 
-    # 6. OPTIONAL: FILTER BY SPECIFIC TRAVEL DATE (running days)
+    # 6. OPTIONAL: FILTER BY SPECIFIC TRAVEL DATE (running days at boarding stations)
     if search_date is not None:
-        weekday0 = search_date.weekday()  # Monday=0
+        weekday0 = search_date.weekday()  # Monday=0 — date user leaves START station
 
-        valid_routes = valid_routes[valid_routes["train1"].apply(lambda t: train_runs_on(t, weekday0))]
+        valid_routes = valid_routes.copy()
+        # Train 1: running days are for ORIGIN; adjust by journey day at start station
+        t1_ok = [
+            train_runs_on(
+                tn,
+                origin_weekday_for_boarding(weekday0, day),
+            )
+            for tn, day in zip(valid_routes["train1"], valid_routes["train1_start_day"])
+        ]
+        valid_routes = valid_routes[t1_ok]
 
         if not valid_routes.empty:
-            valid_routes = valid_routes.copy()
             offset_days = (
                 (valid_routes["t1_duration_hrs"] + valid_routes["layover_hours"]) // 24
             ).astype(int)
             valid_routes["train2_day_offset"] = offset_days
-            train2_weekday = (weekday0 + offset_days) % 7
+            # Weekday when Train 2 leaves the mid station
+            mid_weekday = (weekday0 + offset_days) % 7
+            # Convert mid-station weekday → Train 2 origin weekday using Train 2's day at mid
             keep_mask = [
-                train_runs_on(tn, wd) for tn, wd in zip(valid_routes["train2"], train2_weekday)
+                train_runs_on(tn, origin_weekday_for_boarding(int(mwd), day))
+                for tn, mwd, day in zip(
+                    valid_routes["train2"], mid_weekday, valid_routes["train2_mid_day"]
+                )
             ]
             valid_routes = valid_routes[keep_mask]
 
@@ -527,9 +659,15 @@ def find_direct_trains(
     pref_arr_after=None,
     pref_arr_before=None,
     search_date=None,
+    flexible_days=0,
     sort_by="fastest",
 ):
-    """Trains that stop at start then later at end — no interchange needed."""
+    """
+    Trains that stop at start then later at end — no interchange needed.
+
+    search_date = date you board at START station (not necessarily the origin day).
+    flexible_days = also check ±N days around search_date (0 = exact date only).
+    """
     if not start_code or not end_code or start_code == end_code:
         return pd.DataFrame()
 
@@ -569,8 +707,52 @@ def find_direct_trains(
         merged = merged[merged["arr_time"] <= pref_arr_before]
 
     if search_date is not None and not merged.empty:
-        weekday0 = search_date.weekday()
-        merged = merged[merged["train_number"].apply(lambda t: train_runs_on(t, weekday0))]
+        flex = max(0, int(flexible_days or 0))
+        candidate_dates = [
+            search_date + datetime.timedelta(days=delta) for delta in range(-flex, flex + 1)
+        ]
+
+        kept_rows = []
+        for row in merged.itertuples(index=False):
+            matching_dates = [
+                d
+                for d in candidate_dates
+                if train_runs_on_boarding_date(row.train_number, d, row.dep_day)
+            ]
+            if not matching_dates:
+                continue
+            # Prefer the exact travel date, else nearest day
+            best = min(
+                matching_dates,
+                key=lambda d: (abs((d - search_date).days), d.toordinal()),
+            )
+            origin_wd = origin_weekday_for_boarding(best.weekday(), row.dep_day)
+            kept_rows.append(
+                {
+                    "train_number": row.train_number,
+                    "train_name": row.train_name,
+                    "dep_time": row.dep_time,
+                    "arr_time": row.arr_time,
+                    "dep_day": row.dep_day,
+                    "arr_day": row.arr_day,
+                    "duration_hrs": row.duration_hrs,
+                    "start_seq": row.start_seq,
+                    "end_seq": row.end_seq,
+                    "boarding_date": best,
+                    "available_dates": ", ".join(
+                        d.strftime("%a %d %b") for d in matching_dates
+                    ),
+                    "leaves_origin_on": WEEKDAYS[origin_wd],
+                }
+            )
+
+        merged = pd.DataFrame(kept_rows)
+    else:
+        if not merged.empty:
+            merged = merged.copy()
+            merged["boarding_date"] = None
+            merged["available_dates"] = ""
+            merged["leaves_origin_on"] = ""
 
     if merged.empty:
         return pd.DataFrame()
@@ -579,36 +761,58 @@ def find_direct_trains(
     merged["Running_Days"] = merged["train_number"].apply(running_days_text)
     merged["Stops_Between"] = (merged["end_seq"] - merged["start_seq"] - 1).astype(int)
 
-    out = merged[
-        [
-            "train_number",
-            "train_name",
-            "dep_time",
-            "arr_time",
-            "dep_day",
-            "arr_day",
-            "duration_hrs",
-            "Stops_Between",
-            "Running_Days",
-        ]
-    ].copy()
+    out_cols = [
+        "train_number",
+        "train_name",
+        "dep_time",
+        "arr_time",
+        "dep_day",
+        "arr_day",
+        "duration_hrs",
+        "Stops_Between",
+        "Running_Days",
+        "leaves_origin_on",
+        "boarding_date",
+        "available_dates",
+    ]
+    out = merged[out_cols].copy()
     out["dep_time"] = out["dep_time"].apply(format_time)
     out["arr_time"] = out["arr_time"].apply(format_time)
     out["duration_hrs"] = out["duration_hrs"].round(1)
+    out["board_date_iso"] = out["boarding_date"].apply(
+        lambda d: d.isoformat() if isinstance(d, datetime.date) else ""
+    )
+    out["boarding_date"] = out["boarding_date"].apply(
+        lambda d: d.strftime("%a %d %b %Y") if isinstance(d, datetime.date) else ""
+    )
     out = out.rename(
         columns={
             "train_number": "Train_No",
             "train_name": "Train_Name",
             "dep_time": "Departure",
             "arr_time": "Arrival",
-            "dep_day": "Dep_Day",
-            "arr_day": "Arr_Day",
+            "dep_day": "Journey_Day_At_Start",
+            "arr_day": "Journey_Day_At_End",
             "duration_hrs": "Duration_Hrs",
+            "leaves_origin_on": "Leaves_Origin_On",
+            "boarding_date": "Board_On",
+            "available_dates": "Also_OK_On",
+            "board_date_iso": "Board_Date",
         }
     )
 
     sort_map = {"fastest": "Duration_Hrs", "departure": "Departure", "layover": "Duration_Hrs"}
     out = out.sort_values(sort_map.get(sort_by, "Duration_Hrs")).reset_index(drop=True)
+
+        # Hide empty flexible-date columns when not used
+    if search_date is None:
+        out = out.drop(
+            columns=["Board_On", "Also_OK_On", "Leaves_Origin_On", "Board_Date"],
+            errors="ignore",
+        )
+    elif int(flexible_days or 0) <= 0:
+        out = out.drop(columns=["Also_OK_On"], errors="ignore")
+
     return out
 
 
