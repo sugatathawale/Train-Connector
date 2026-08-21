@@ -7,6 +7,7 @@ availability together (not one train at a time).
 
 from __future__ import annotations
 
+import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -375,3 +376,140 @@ def format_class_line(row: dict) -> str:
     if row.get("fare"):
         parts.append(f"₹{row['fare']}")
     return " · ".join(parts)
+
+
+# Preferred travel classes shown in the UI filter.
+TRAVEL_CLASSES = ["SL", "3A", "2A", "1A", "CC", "EC", "2S", "3E", "EA"]
+
+
+def _norm_class(value: str) -> str:
+    return str(value or "").strip().upper().replace(" ", "")
+
+
+def filter_classes(classes: list[dict], preferred: Optional[list[str]] = None) -> list[dict]:
+    """Keep only preferred classes when a preference list is set."""
+    rows = classes or []
+    if not preferred:
+        return rows
+    want = {_norm_class(c) for c in preferred if c}
+    if not want:
+        return rows
+    matched = [r for r in rows if _norm_class(r.get("class")) in want]
+    return matched if matched else rows
+
+
+def _parse_fare(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    s = re.sub(r"[^\d.]", "", str(value))
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_chance(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    s = re.sub(r"[^\d.]", "", str(value))
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _wl_number(status: str) -> int:
+    s = (status or "").upper()
+    m = re.search(r"(?:WL|WAIT(?:LIST)?)[^\d]*(\d+)", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return 99
+    if "WL" in s or "WAIT" in s:
+        return 50
+    return 99
+
+
+def score_class_row(row: dict) -> float:
+    """
+    Higher = more bookable.
+    AVAILABLE/AVL/CNF ≈ 100, RAC ≈ 60, short WL better than long WL, REGRET = 0.
+    """
+    status = str(row.get("status") or "").upper()
+    tone = status_tone(status)
+    chance = _parse_chance(row.get("chance"))
+
+    if tone == "good":
+        base = 100.0
+    elif tone == "warn":
+        base = 62.0
+    elif tone == "wait":
+        base = max(5.0, 45.0 - min(_wl_number(status), 40))
+    elif tone == "bad":
+        base = 0.0
+    else:
+        base = 20.0
+
+    if chance is not None:
+        # Blend API confirmation % when present
+        base = max(base, min(100.0, chance))
+    return base
+
+
+def score_leg_availability(leg: dict, preferred: Optional[list[str]] = None) -> float:
+    """Best class score on one leg (optionally limited to preferred classes)."""
+    if not leg or not leg.get("ok"):
+        return -1.0
+    if leg.get("departed"):
+        return 0.0
+    rows = filter_classes(leg.get("classes") or [], preferred)
+    if not rows:
+        return -1.0
+    return max(score_class_row(r) for r in rows)
+
+
+def best_fare_for_leg(leg: dict, preferred: Optional[list[str]] = None) -> Optional[float]:
+    rows = filter_classes((leg or {}).get("classes") or [], preferred)
+    fares = [f for f in (_parse_fare(r.get("fare")) for r in rows) if f is not None]
+    return min(fares) if fares else None
+
+
+def score_connection_seats(seat_data: dict, preferred: Optional[list[str]] = None) -> dict:
+    """
+    Score a two-leg seat check.
+    Bottleneck = worse of the two legs (you need seats on BOTH).
+    """
+    leg1 = (seat_data or {}).get("leg1") or {}
+    leg2 = (seat_data or {}).get("leg2") or {}
+    s1 = score_leg_availability(leg1, preferred)
+    s2 = score_leg_availability(leg2, preferred)
+    f1 = best_fare_for_leg(leg1, preferred)
+    f2 = best_fare_for_leg(leg2, preferred)
+    total_fare = None
+    if f1 is not None and f2 is not None:
+        total_fare = f1 + f2
+    elif f1 is not None:
+        total_fare = f1
+    elif f2 is not None:
+        total_fare = f2
+
+    if s1 < 0 and s2 < 0:
+        bottleneck = -1.0
+    elif s1 < 0:
+        bottleneck = s2 * 0.5
+    elif s2 < 0:
+        bottleneck = s1 * 0.5
+    else:
+        bottleneck = min(s1, s2)
+
+    return {
+        "seat_score": round(bottleneck, 1),
+        "leg1_score": round(s1, 1),
+        "leg2_score": round(s2, 1),
+        "est_fare": total_fare,
+    }

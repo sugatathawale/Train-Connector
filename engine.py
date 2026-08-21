@@ -20,6 +20,60 @@ WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]  # index 0 = Monday
 # Booking tags sometimes get scraped into the station name (not real stations).
 _BOOKING_TAG_RE = re.compile(r"\s*\((?:PQ|RL)\)\s*", re.IGNORECASE)
 
+# Major metro / terminus clusters — used by "include nearby stations".
+# Each code maps to the full cluster it belongs to (including itself).
+_STATION_CLUSTERS = [
+    # Delhi NCR
+    {"NDLS", "DLI", "NZM", "ANVT", "DEE", "DEC", "DSJ", "GZB"},
+    # Mumbai
+    {"CSMT", "LTT", "BDTS", "MMCT", "DDR", "TNA", "KYN"},
+    # Kolkata
+    {"HWH", "KOAA", "SDAH"},
+    # Chennai
+    {"MAS", "MS"},
+    # Bengaluru
+    {"SBC", "YPR", "SMVB", "BNC"},
+    # Hyderabad
+    {"HYB", "SC", "KCG"},
+]
+
+_CLUSTER_LOOKUP = {}
+for _cluster in _STATION_CLUSTERS:
+    for _code in _cluster:
+        _CLUSTER_LOOKUP[_code] = _cluster
+
+
+def get_nearby_station_codes(station_code: str, include_nearby: bool = True) -> list:
+    """
+    Return station codes to search for a given origin/destination.
+    With include_nearby=False (or unknown code), returns [station_code] only.
+    """
+    code = (station_code or "").strip().upper()
+    if not code:
+        return []
+    if not include_nearby:
+        return [code]
+    cluster = _CLUSTER_LOOKUP.get(code)
+    if not cluster:
+        return [code]
+    # Prefer the selected code first, then the rest alphabetically
+    others = sorted(c for c in cluster if c != code)
+    return [code] + others
+
+
+def station_label(station_code: str) -> str:
+    """'NDLS' -> 'NEW DELHI (NDLS)' using master names when possible."""
+    code = (station_code or "").strip().upper()
+    if not code:
+        return ""
+    name = CODE_TO_NAME.get(code) or code
+    return f"{name} ({code})"
+
+
+def nearby_station_labels(station_code: str) -> list:
+    """Human-readable nearby options for captions / UI hints."""
+    return [station_label(c) for c in get_nearby_station_codes(station_code, include_nearby=True)]
+
 
 def clean_station_name(name: str) -> str:
     """
@@ -367,13 +421,25 @@ def find_connections_pro(
     pref_arr_after=None,
     pref_arr_before=None,
     search_date=None,          # datetime.date or None
+    flexible_days=0,           # also try ±N days around search_date
+    include_nearby=False,      # expand start/end to metro clusters
     sort_by="fastest",         # "fastest" | "layover" | "departure"
     exclude_overnight=False,
     max_results=None,
 ):
+    start_codes = get_nearby_station_codes(start_code, include_nearby=include_nearby)
+    end_codes = get_nearby_station_codes(end_code, include_nearby=include_nearby)
+    # Same-metro pair (e.g. NDLS → NZM): don't expand both into one overlapping cluster
+    if set(start_codes) & set(end_codes):
+        start_codes = [(start_code or "").strip().upper()]
+        end_codes = [(end_code or "").strip().upper()]
+    end_codes = [c for c in end_codes if c and c not in start_codes]
+    if not start_codes or not end_codes:
+        return pd.DataFrame()
+
     # 1. LEG 1 (start -> mid)
-    starts = df2[df2["station_code"] == start_code][
-        ["train_number", "stop_seq", "abs_departure", "departure", "train_name", "day"]
+    starts = df2[df2["station_code"].isin(start_codes)][
+        ["train_number", "stop_seq", "abs_departure", "departure", "train_name", "day", "station_code"]
     ]
     starts = starts.rename(
         columns={
@@ -382,6 +448,7 @@ def find_connections_pro(
             "departure": "start_time",
             "train_name": "train1_name",
             "day": "train1_start_day",
+            "station_code": "start_from",
         }
     )
 
@@ -392,6 +459,8 @@ def find_connections_pro(
 
     leg1 = pd.merge(starts, df2, on="train_number")
     leg1 = leg1[leg1["stop_seq"] > leg1["start_seq"]]
+    # Mid station must not be another "start" terminal we're treating as origin
+    leg1 = leg1[~leg1["station_code"].isin(start_codes)]
     leg1["t1_duration_hrs"] = (leg1["abs_arrival"] - leg1["abs_start_dep"]).dt.total_seconds() / 3600
     leg1 = leg1[leg1["t1_duration_hrs"] > 0]
 
@@ -406,6 +475,7 @@ def find_connections_pro(
             "t1_duration_hrs",
             "train1_start_day",
             "day",
+            "start_from",
         ]
     ]
     leg1 = leg1.rename(
@@ -419,8 +489,8 @@ def find_connections_pro(
     )
 
     # 2. LEG 2 (mid -> end)
-    ends = df2[df2["station_code"] == end_code][
-        ["train_number", "stop_seq", "abs_arrival", "arrival", "train_name"]
+    ends = df2[df2["station_code"].isin(end_codes)][
+        ["train_number", "stop_seq", "abs_arrival", "arrival", "train_name", "station_code"]
     ]
     ends = ends.rename(
         columns={
@@ -428,6 +498,7 @@ def find_connections_pro(
             "abs_arrival": "abs_end_arr",
             "arrival": "end_time",
             "train_name": "train2_name",
+            "station_code": "end_at",
         }
     )
 
@@ -438,11 +509,21 @@ def find_connections_pro(
 
     leg2 = pd.merge(ends, df2, on="train_number")
     leg2 = leg2[leg2["stop_seq"] < leg2["end_seq"]]
+    leg2 = leg2[~leg2["station_code"].isin(end_codes)]
     leg2["t2_duration_hrs"] = (leg2["abs_end_arr"] - leg2["abs_departure"]).dt.total_seconds() / 3600
     leg2 = leg2[leg2["t2_duration_hrs"] > 0]
 
     leg2 = leg2[
-        ["train_number", "train2_name", "station_code", "departure", "end_time", "t2_duration_hrs", "day"]
+        [
+            "train_number",
+            "train2_name",
+            "station_code",
+            "departure",
+            "end_time",
+            "t2_duration_hrs",
+            "day",
+            "end_at",
+        ]
     ]
     leg2 = leg2.rename(
         columns={
@@ -496,37 +577,67 @@ def find_connections_pro(
         if valid_routes.empty:
             return pd.DataFrame()
 
-    # 6. OPTIONAL: FILTER BY SPECIFIC TRAVEL DATE (running days at boarding stations)
+    # 6. OPTIONAL: FILTER BY TRAVEL DATE (± flexible_days)
     if search_date is not None:
-        weekday0 = search_date.weekday()  # Monday=0 — date user leaves START station
-
-        valid_routes = valid_routes.copy()
-        # Train 1: running days are for ORIGIN; adjust by journey day at start station
-        t1_ok = [
-            train_runs_on(
-                tn,
-                origin_weekday_for_boarding(weekday0, day),
-            )
-            for tn, day in zip(valid_routes["train1"], valid_routes["train1_start_day"])
+        flex = max(0, int(flexible_days or 0))
+        candidate_dates = [
+            search_date + datetime.timedelta(days=delta) for delta in range(-flex, flex + 1)
         ]
-        valid_routes = valid_routes[t1_ok]
 
-        if not valid_routes.empty:
-            offset_days = (
-                (valid_routes["t1_duration_hrs"] + valid_routes["layover_hours"]) // 24
-            ).astype(int)
-            valid_routes["train2_day_offset"] = offset_days
-            # Weekday when Train 2 leaves the mid station
-            mid_weekday = (weekday0 + offset_days) % 7
-            # Convert mid-station weekday → Train 2 origin weekday using Train 2's day at mid
-            keep_mask = [
-                train_runs_on(tn, origin_weekday_for_boarding(int(mwd), day))
-                for tn, mwd, day in zip(
-                    valid_routes["train2"], mid_weekday, valid_routes["train2_mid_day"]
-                )
-            ]
-            valid_routes = valid_routes[keep_mask]
+        kept_rows = []
+        for row in valid_routes.itertuples(index=False):
+            matching = []
+            for d in candidate_dates:
+                weekday0 = d.weekday()
+                if not train_runs_on(
+                    row.train1,
+                    origin_weekday_for_boarding(weekday0, row.train1_start_day),
+                ):
+                    continue
+                offset_days = int((row.t1_duration_hrs + row.layover_hours) // 24)
+                mid_weekday = (weekday0 + offset_days) % 7
+                if not train_runs_on(
+                    row.train2,
+                    origin_weekday_for_boarding(mid_weekday, row.train2_mid_day),
+                ):
+                    continue
+                matching.append((d, offset_days))
 
+            if not matching:
+                continue
+            best_date, best_offset = min(
+                matching,
+                key=lambda x: (abs((x[0] - search_date).days), x[0].toordinal()),
+            )
+            also_ok = ", ".join(
+                d.strftime("%a %d %b") for d, _ in matching if d != best_date
+            )
+            kept_rows.append(
+                {
+                    "station_name": row.station_name,
+                    "station_c": row.station_c,
+                    "train1": row.train1,
+                    "train1_name": row.train1_name,
+                    "dep_from_a": row.dep_from_a,
+                    "arr_at_c": row.arr_at_c,
+                    "train2": row.train2,
+                    "train2_name": row.train2_name,
+                    "dep_from_c": row.dep_from_c,
+                    "arr_at_b": row.arr_at_b,
+                    "t1_duration_hrs": row.t1_duration_hrs,
+                    "t2_duration_hrs": row.t2_duration_hrs,
+                    "layover_hours": row.layover_hours,
+                    "total_journey_hrs": row.total_journey_hrs,
+                    "crosses_midnight": row.crosses_midnight,
+                    "train2_day_offset": best_offset,
+                    "start_from": row.start_from,
+                    "end_at": row.end_at,
+                    "boarding_date": best_date,
+                    "available_dates": also_ok,
+                }
+            )
+
+        valid_routes = pd.DataFrame(kept_rows)
         if valid_routes.empty:
             return pd.DataFrame()
     else:
@@ -534,11 +645,18 @@ def find_connections_pro(
         valid_routes["train2_day_offset"] = (
             (valid_routes["t1_duration_hrs"] + valid_routes["layover_hours"]) // 24
         ).astype(int)
+        valid_routes["boarding_date"] = None
+        valid_routes["available_dates"] = ""
 
-    # 7. SORT + DEDUPE (keep the best duplicate train1/train2 pair per chosen metric)
+    # 7. SORT + DEDUPE (best train1/train2 pair; keep preferred start/end when nearby)
     sort_col_map = {"fastest": "total_journey_hrs", "layover": "layover_hours", "departure": "dep_from_a"}
     sort_col = sort_col_map.get(sort_by, "total_journey_hrs")
-    valid_routes = valid_routes.sort_values(sort_col)
+    # Prefer exact requested stations when nearby search is on
+    valid_routes["_start_pref"] = (valid_routes["start_from"] != start_code).astype(int)
+    valid_routes["_end_pref"] = (valid_routes["end_at"] != end_code).astype(int)
+    valid_routes = valid_routes.sort_values(
+        ["_start_pref", "_end_pref", sort_col]
+    )
     valid_routes = valid_routes.drop_duplicates(subset=["train1", "train2"], keep="first")
 
     # 8. OUTPUT
@@ -560,6 +678,10 @@ def find_connections_pro(
             "total_journey_hrs",
             "crosses_midnight",
             "train2_day_offset",
+            "start_from",
+            "end_at",
+            "boarding_date",
+            "available_dates",
         ]
     ].copy()
 
@@ -574,6 +696,14 @@ def find_connections_pro(
     ]
     final_output["Leg1_Hrs"] = final_output["t1_duration_hrs"].round(1)
     final_output["Leg2_Hrs"] = final_output["t2_duration_hrs"].round(1)
+    final_output["Board_Date"] = final_output["boarding_date"].apply(
+        lambda d: d.isoformat() if isinstance(d, datetime.date) else ""
+    )
+    final_output["Board_On"] = final_output["boarding_date"].apply(
+        lambda d: d.strftime("%a %d %b %Y") if isinstance(d, datetime.date) else ""
+    )
+    final_output["Start_From"] = final_output["start_from"].apply(station_label)
+    final_output["End_At"] = final_output["end_at"].apply(station_label)
 
     final_output = final_output.rename(
         columns={
@@ -590,6 +720,7 @@ def find_connections_pro(
             "layover_hours": "Layover_Hrs",
             "total_journey_hrs": "Total_Hrs",
             "train2_day_offset": "Train2_Day_Offset",
+            "available_dates": "Also_OK_On",
         }
     )
 
@@ -600,6 +731,8 @@ def find_connections_pro(
     final_output["Total_Hrs"] = final_output["Total_Hrs"].round(1)
 
     display_cols = [
+        "Start_From",
+        "End_At",
         "Via_Station",
         "Via_Code",
         "Train_1_No",
@@ -619,8 +752,24 @@ def find_connections_pro(
         "Train_1_Running_Days",
         "Train_2_Running_Days",
         "Train2_Day_Offset",
+        "Board_On",
+        "Board_Date",
+        "Also_OK_On",
     ]
     final_output = final_output[display_cols]
+
+    if search_date is None:
+        final_output = final_output.drop(
+            columns=["Board_On", "Board_Date", "Also_OK_On"],
+            errors="ignore",
+        )
+    elif int(flexible_days or 0) <= 0:
+        final_output = final_output.drop(columns=["Also_OK_On"], errors="ignore")
+
+    # Keep Start_From / End_At only when nearby search actually used alternate terminals
+    if "Start_From" in final_output.columns and "End_At" in final_output.columns:
+        if final_output["Start_From"].nunique() <= 1 and final_output["End_At"].nunique() <= 1:
+            final_output = final_output.drop(columns=["Start_From", "End_At"], errors="ignore")
 
     out_sort_col = {
         "fastest": "Total_Hrs",
@@ -635,12 +784,18 @@ def find_connections_pro(
     return final_output
 
 
-def get_possible_via_stations(start_code, end_code):
+def get_possible_via_stations(start_code, end_code, include_nearby=False):
     """Return a short, route-specific list of 'NAME (CODE)' via-station options
     (instead of forcing the user to scroll every station in the country)."""
     if not start_code or not end_code or start_code == end_code:
         return []
-    results = find_connections_pro(start_code, end_code, min_layover_hrs=0, max_layover_hrs=24)
+    results = find_connections_pro(
+        start_code,
+        end_code,
+        min_layover_hrs=0,
+        max_layover_hrs=24,
+        include_nearby=include_nearby,
+    )
     if results.empty:
         return []
     pairs = results[["Via_Station", "Via_Code"]].drop_duplicates()
@@ -660,6 +815,7 @@ def find_direct_trains(
     pref_arr_before=None,
     search_date=None,
     flexible_days=0,
+    include_nearby=False,
     sort_by="fastest",
 ):
     """
@@ -667,28 +823,37 @@ def find_direct_trains(
 
     search_date = date you board at START station (not necessarily the origin day).
     flexible_days = also check ±N days around search_date (0 = exact date only).
+    include_nearby = also search metro-cluster alternate terminals.
     """
-    if not start_code or not end_code or start_code == end_code:
+    start_codes = get_nearby_station_codes(start_code, include_nearby=include_nearby)
+    end_codes = get_nearby_station_codes(end_code, include_nearby=include_nearby)
+    if set(start_codes) & set(end_codes):
+        start_codes = [(start_code or "").strip().upper()]
+        end_codes = [(end_code or "").strip().upper()]
+    end_codes = [c for c in end_codes if c and c not in start_codes]
+    if not start_codes or not end_codes:
         return pd.DataFrame()
 
-    starts = df2[df2["station_code"] == start_code][
-        ["train_number", "train_name", "stop_seq", "abs_departure", "departure", "day"]
+    starts = df2[df2["station_code"].isin(start_codes)][
+        ["train_number", "train_name", "stop_seq", "abs_departure", "departure", "day", "station_code"]
     ].rename(
         columns={
             "stop_seq": "start_seq",
             "abs_departure": "abs_start_dep",
             "departure": "dep_time",
             "day": "dep_day",
+            "station_code": "start_from",
         }
     )
-    ends = df2[df2["station_code"] == end_code][
-        ["train_number", "stop_seq", "abs_arrival", "arrival", "day"]
+    ends = df2[df2["station_code"].isin(end_codes)][
+        ["train_number", "stop_seq", "abs_arrival", "arrival", "day", "station_code"]
     ].rename(
         columns={
             "stop_seq": "end_seq",
             "abs_arrival": "abs_end_arr",
             "arrival": "arr_time",
             "day": "arr_day",
+            "station_code": "end_at",
         }
     )
 
@@ -738,6 +903,8 @@ def find_direct_trains(
                     "duration_hrs": row.duration_hrs,
                     "start_seq": row.start_seq,
                     "end_seq": row.end_seq,
+                    "start_from": row.start_from,
+                    "end_at": row.end_at,
                     "boarding_date": best,
                     "available_dates": ", ".join(
                         d.strftime("%a %d %b") for d in matching_dates
@@ -757,7 +924,12 @@ def find_direct_trains(
     if merged.empty:
         return pd.DataFrame()
 
-    merged = merged.sort_values("duration_hrs").drop_duplicates(subset=["train_number"], keep="first")
+    # Prefer exact requested terminals, then fastest
+    merged["_start_pref"] = (merged["start_from"] != start_code).astype(int)
+    merged["_end_pref"] = (merged["end_at"] != end_code).astype(int)
+    merged = merged.sort_values(["_start_pref", "_end_pref", "duration_hrs"]).drop_duplicates(
+        subset=["train_number"], keep="first"
+    )
     merged["Running_Days"] = merged["train_number"].apply(running_days_text)
     merged["Stops_Between"] = (merged["end_seq"] - merged["start_seq"] - 1).astype(int)
 
@@ -774,6 +946,8 @@ def find_direct_trains(
         "leaves_origin_on",
         "boarding_date",
         "available_dates",
+        "start_from",
+        "end_at",
     ]
     out = merged[out_cols].copy()
     out["dep_time"] = out["dep_time"].apply(format_time)
@@ -785,6 +959,8 @@ def find_direct_trains(
     out["boarding_date"] = out["boarding_date"].apply(
         lambda d: d.strftime("%a %d %b %Y") if isinstance(d, datetime.date) else ""
     )
+    out["Start_From"] = out["start_from"].apply(station_label)
+    out["End_At"] = out["end_at"].apply(station_label)
     out = out.rename(
         columns={
             "train_number": "Train_No",
@@ -800,11 +976,12 @@ def find_direct_trains(
             "board_date_iso": "Board_Date",
         }
     )
+    out = out.drop(columns=["start_from", "end_at"], errors="ignore")
 
     sort_map = {"fastest": "Duration_Hrs", "departure": "Departure", "layover": "Duration_Hrs"}
     out = out.sort_values(sort_map.get(sort_by, "Duration_Hrs")).reset_index(drop=True)
 
-        # Hide empty flexible-date columns when not used
+    # Hide empty flexible-date columns when not used
     if search_date is None:
         out = out.drop(
             columns=["Board_On", "Also_OK_On", "Leaves_Origin_On", "Board_Date"],
@@ -812,6 +989,15 @@ def find_direct_trains(
         )
     elif int(flexible_days or 0) <= 0:
         out = out.drop(columns=["Also_OK_On"], errors="ignore")
+
+    if not include_nearby:
+        same_start = out["Start_From"].nunique() <= 1 if "Start_From" in out.columns else True
+        same_end = out["End_At"].nunique() <= 1 if "End_At" in out.columns else True
+        if same_start and same_end:
+            out = out.drop(columns=["Start_From", "End_At"], errors="ignore")
+    elif "Start_From" in out.columns and "End_At" in out.columns:
+        if out["Start_From"].nunique() <= 1 and out["End_At"].nunique() <= 1:
+            out = out.drop(columns=["Start_From", "End_At"], errors="ignore")
 
     return out
 
@@ -864,9 +1050,15 @@ def get_trains_at_station(station_code, time_after=None, time_before=None):
     return out.sort_values("Departure").reset_index(drop=True)
 
 
-def get_top_via_hubs(start_code, end_code, limit=15):
+def get_top_via_hubs(start_code, end_code, limit=15, include_nearby=False):
     """Most common interchange stations for a route (by number of valid connections)."""
-    results = find_connections_pro(start_code, end_code, min_layover_hrs=0.5, max_layover_hrs=18)
+    results = find_connections_pro(
+        start_code,
+        end_code,
+        min_layover_hrs=0.5,
+        max_layover_hrs=18,
+        include_nearby=include_nearby,
+    )
     if results.empty:
         return pd.DataFrame()
     hubs = (

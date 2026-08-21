@@ -17,6 +17,9 @@ try:
         get_train_summary,
         format_duration,
         irctc_train_url,
+        get_nearby_station_codes,
+        nearby_station_labels,
+        station_label,
         WEEKDAYS,
     )
     from live_availability import (
@@ -24,6 +27,9 @@ try:
         fetch_route_availability,
         pick_train,
         status_tone,
+        filter_classes,
+        score_connection_seats,
+        TRAVEL_CLASSES,
     )
 except FileNotFoundError as e:
     st.set_page_config(page_title="Train Connector", layout="wide")
@@ -65,6 +71,230 @@ if "show_direct_from_conn" not in st.session_state:
     st.session_state.show_direct_from_conn = False
 if "conn_directs" not in st.session_state:
     st.session_state.conn_directs = None
+if "qp_bootstrapped" not in st.session_state:
+    st.session_state.qp_bootstrapped = False
+
+
+def _label_for_code(code: str) -> str:
+    """Find 'NAME (CODE)' in station_list, else build a label."""
+    code = (code or "").strip().upper()
+    if not code:
+        return ""
+    suffix = f"({code})"
+    for label in station_list:
+        if label.endswith(suffix):
+            return label
+    return station_label(code)
+
+
+def _qp_get(name: str, default: str = "") -> str:
+    try:
+        val = st.query_params.get(name, default)
+    except Exception:
+        return default
+    if isinstance(val, list):
+        return str(val[0]) if val else default
+    return str(val) if val is not None else default
+
+
+def bootstrap_from_query_params():
+    """Prefill connection search widgets once from ?from=&to=&date=…"""
+    if st.session_state.qp_bootstrapped:
+        return
+    st.session_state.qp_bootstrapped = True
+
+    from_code = _qp_get("from").upper()
+    to_code = _qp_get("to").upper()
+    if from_code:
+        st.session_state[f"start_{st.session_state.swap_tick}"] = _label_for_code(from_code)
+    if to_code:
+        st.session_state[f"end_{st.session_state.swap_tick}"] = _label_for_code(to_code)
+
+    date_s = _qp_get("date")
+    if date_s:
+        try:
+            st.session_state["conn_travel_date"] = datetime.date.fromisoformat(date_s)
+            st.session_state["conn_use_date"] = True
+        except ValueError:
+            pass
+
+    flex = _qp_get("flex")
+    if flex in ("1", "true", "yes"):
+        st.session_state["conn_flex_on"] = True
+    elif flex in ("0", "false", "no"):
+        st.session_state["conn_flex_on"] = False
+
+    nearby = _qp_get("nearby")
+    if nearby in ("1", "true", "yes"):
+        st.session_state["conn_nearby"] = True
+    elif nearby in ("0", "false", "no"):
+        st.session_state["conn_nearby"] = False
+
+    classes = _qp_get("class")
+    if classes:
+        picked = [c.strip().upper() for c in classes.split(",") if c.strip()]
+        st.session_state["conn_pref_classes"] = [c for c in picked if c in TRAVEL_CLASSES]
+
+    quota = _qp_get("quota").upper()
+    if quota in ("GN", "TQ", "PT", "LD", "SS"):
+        st.session_state["conn_quota"] = quota
+
+    theme = _qp_get("theme").lower()
+    if theme in ("dark", "light"):
+        st.session_state.theme = theme
+
+
+def update_search_query_params(meta: dict):
+    """Write current connection search into the browser URL for sharing."""
+    params = {}
+    if meta.get("s_code"):
+        params["from"] = meta["s_code"]
+    if meta.get("e_code"):
+        params["to"] = meta["e_code"]
+    if meta.get("search_date"):
+        params["date"] = meta["search_date"].isoformat()
+    if meta.get("flexible"):
+        params["flex"] = "1"
+    if meta.get("include_nearby"):
+        params["nearby"] = "1"
+    prefs = meta.get("pref_classes") or []
+    if prefs:
+        params["class"] = ",".join(prefs)
+    if meta.get("quota") and meta["quota"] != "GN":
+        params["quota"] = meta["quota"]
+    params["theme"] = st.session_state.theme
+    try:
+        st.query_params.clear()
+        st.query_params.update(params)
+    except Exception:
+        pass
+
+
+def build_share_url(meta: dict) -> str:
+    """Relative share link with query string (works on Streamlit Cloud / local)."""
+    parts = []
+    if meta.get("s_code"):
+        parts.append(f"from={meta['s_code']}")
+    if meta.get("e_code"):
+        parts.append(f"to={meta['e_code']}")
+    if meta.get("search_date"):
+        parts.append(f"date={meta['search_date'].isoformat()}")
+    if meta.get("flexible"):
+        parts.append("flex=1")
+    if meta.get("include_nearby"):
+        parts.append("nearby=1")
+    prefs = meta.get("pref_classes") or []
+    if prefs:
+        parts.append("class=" + ",".join(prefs))
+    if meta.get("quota") and meta["quota"] != "GN":
+        parts.append(f"quota={meta['quota']}")
+    return ("?" + "&".join(parts)) if parts else ""
+
+
+def connection_cache_key(row, start_code, end_code, search_date, quota) -> str:
+    board = str(row.get("Board_Date") or search_date or "")
+    return (
+        f"{start_code}|{row.get('Via_Code')}|{end_code}|"
+        f"{row.get('Train_1_No')}|{row.get('Train_2_No')}|"
+        f"{board}|{quota}|{row.get('Train2_Day_Offset', 0)}"
+    )
+
+
+def format_connection_itinerary(
+    results: pd.DataFrame,
+    start_label: str,
+    end_label: str,
+    limit: int = 5,
+) -> str:
+    lines = [
+        "Train Connector itinerary",
+        f"{start_label} → {end_label}",
+        "",
+    ]
+    for i, (_, row) in enumerate(results.head(limit).iterrows(), start=1):
+        board = row.get("Board_On") or "Any day"
+        start_from = row.get("Start_From") or start_label
+        end_at = row.get("End_At") or end_label
+        lines.append(f"Option {i} · via {row['Via_Station']} ({row['Via_Code']})")
+        lines.append(f"  Board: {board}")
+        lines.append(
+            f"  Train 1: {row['Train_1_No']} {row['Train_1_Name']} · "
+            f"{start_from} {row['Leave_Start']} → {row['Arrive_Mid']}"
+        )
+        lines.append(
+            f"  Wait {format_duration(row['Layover_Hrs'])} ({row.get('Comfort', '')})"
+        )
+        lines.append(
+            f"  Train 2: {row['Train_2_No']} {row['Train_2_Name']} · "
+            f"{row['Leave_Mid']} → {end_at} {row['Arrive_End']}"
+        )
+        lines.append(f"  Total: {format_duration(row['Total_Hrs'])}")
+        if row.get("Seat_Score") is not None and str(row.get("Seat_Score")) not in ("", "nan"):
+            fare = row.get("Est_Fare")
+            fare_bit = f" · ~₹{int(fare)}" if pd.notna(fare) else ""
+            lines.append(f"  Seats: score {row['Seat_Score']}{fare_bit}")
+        lines.append("")
+    lines.append("Confirm on IRCTC before booking.")
+    return "\n".join(lines)
+
+
+def apply_seat_scores_to_results(
+    results: pd.DataFrame,
+    start_code: str,
+    end_code: str,
+    search_date,
+    quota: str,
+    pref_classes: list,
+) -> pd.DataFrame:
+    """Attach Seat_Score / Est_Fare from seat_cache where available."""
+    if results is None or results.empty:
+        return results
+    out = results.copy()
+    scores, fares = [], []
+    for _, row in out.iterrows():
+        key = connection_cache_key(row, start_code, end_code, search_date, quota)
+        seat = st.session_state.seat_cache.get(key)
+        if not seat:
+            scores.append(None)
+            fares.append(None)
+            continue
+        scored = score_connection_seats(seat, pref_classes or None)
+        scores.append(scored["seat_score"] if scored["seat_score"] >= 0 else None)
+        fares.append(scored["est_fare"])
+    out["Seat_Score"] = scores
+    out["Est_Fare"] = fares
+    return out
+
+
+def sort_results_df(results: pd.DataFrame, sort_by: str) -> pd.DataFrame:
+    if results is None or results.empty:
+        return results
+    out = results.copy()
+    if sort_by == "seats":
+        if "Seat_Score" in out.columns and out["Seat_Score"].notna().any():
+            out = out.sort_values(
+                ["Seat_Score", "Total_Hrs"],
+                ascending=[False, True],
+                na_position="last",
+            )
+        else:
+            out = out.sort_values("Total_Hrs")
+    elif sort_by == "fare":
+        if "Est_Fare" in out.columns and out["Est_Fare"].notna().any():
+            out = out.sort_values(
+                ["Est_Fare", "Total_Hrs"],
+                ascending=[True, True],
+                na_position="last",
+            )
+        else:
+            out = out.sort_values("Total_Hrs")
+    elif sort_by == "layover":
+        out = out.sort_values("Layover_Hrs")
+    elif sort_by == "departure":
+        out = out.sort_values("Leave_Start")
+    else:
+        out = out.sort_values("Total_Hrs")
+    return out.reset_index(drop=True)
 
 
 def extract_code(station_string):
@@ -621,7 +851,7 @@ def _enrich_seat_result(
     return out
 
 
-def render_seat_block(leg: dict, title: str):
+def render_seat_block(leg: dict, title: str, pref_classes: Optional[list] = None):
     scraped = leg.get("scraped_date_label") or leg.get("date") or "—"
     st.markdown(f"**{title}** · `{leg.get('train_number', '')}` {leg.get('train_name', '')}")
     st.caption(
@@ -645,10 +875,12 @@ def render_seat_block(leg: dict, title: str):
         else:
             st.info("This train was not found in live seat results for this date. Please check on IRCTC.")
         return
-    classes = leg.get("classes") or []
+    classes = filter_classes(leg.get("classes") or [], pref_classes)
     if not classes:
         st.caption("No seat class info returned — please check on IRCTC.")
         return
+    if pref_classes:
+        st.caption("Showing preferred class(es): " + ", ".join(pref_classes))
     pills = []
     for row in classes:
         tone = status_tone(row.get("status", ""))
@@ -679,6 +911,7 @@ def render_direct_train_cards(
     end_label: str,
     quota: str = "GN",
     key_prefix: str = "direct",
+    pref_classes: Optional[list] = None,
 ):
     """Show direct trains as cards with optional live seat check (no CSV / IRCTC links)."""
     st.subheader("Direct trains")
@@ -704,10 +937,15 @@ def render_direct_train_cards(
                 if also_ok
                 else ""
             )
+            start_from = row.get("Start_From") or start_label
+            end_at = row.get("End_At") or end_label
             st.markdown(
                 f"""
                 <div class="tc-route-box">
                   <div><b>{row['Train_No']}</b> — {row['Train_Name']}</div>
+                  <div class="tc-muted" style="margin-top:6px;">
+                    {start_from} → {end_at}
+                  </div>
                   <div class="tc-muted" style="margin-top:6px;">
                     Board on: <b>{board}</b>
                     &nbsp;·&nbsp; Runs (from origin): {row.get('Running_Days', '')}
@@ -731,7 +969,9 @@ def render_direct_train_cards(
             elif board_date:
                 st.caption(f"Seat check date: **{pre_status['scraped_date_label']}** · {pre_status['label']}")
 
-            cache_key = f"{key_prefix}|{start_code}|{end_code}|{row['Train_No']}|{board_date}|{quota}"
+            from_code = extract_code(str(row.get("Start_From") or "")) or start_code
+            to_code = extract_code(str(row.get("End_At") or "")) or end_code
+            cache_key = f"{key_prefix}|{from_code}|{to_code}|{row['Train_No']}|{board_date}|{quota}"
 
             if st.button(
                 "Check seats",
@@ -741,7 +981,7 @@ def render_direct_train_cards(
                 help="Gets live seat availability for this train on the boarding date.",
             ):
                 with st.spinner(f"Getting seats for train {row['Train_No']}…"):
-                    route = fetch_route_availability(start_code, end_code, board_date, quota)
+                    route = fetch_route_availability(from_code, to_code, board_date, quota)
                     seat = pick_train(route, str(row["Train_No"]))
                     st.session_state.direct_seat_cache[cache_key] = _enrich_seat_result(
                         seat, board_date, dep_time
@@ -754,7 +994,7 @@ def render_direct_train_cards(
             seat = st.session_state.direct_seat_cache.get(cache_key)
             if seat:
                 st.markdown("##### Seat availability")
-                render_seat_block(seat, "Train")
+                render_seat_block(seat, "Train", pref_classes=pref_classes)
                 st.caption("Seat info from ConfirmTkt. Confirm on IRCTC before booking.")
 
 
@@ -768,6 +1008,7 @@ def render_connection_cards(
     quota: str,
     dark: bool,
     limit: int = 12,
+    pref_classes: Optional[list] = None,
 ):
     st.subheader("Route options")
     st.caption(
@@ -778,10 +1019,15 @@ def render_connection_cards(
     for i, row in results.head(limit).iterrows():
         comfort = row.get("Comfort", "")
         overnight = row.get("Overnight_Layover", "No") == "Yes"
+        seat_bit = ""
+        if row.get("Seat_Score") is not None and pd.notna(row.get("Seat_Score")):
+            seat_bit = f"  ·  seats {row['Seat_Score']:.0f}"
+            if row.get("Est_Fare") is not None and pd.notna(row.get("Est_Fare")):
+                seat_bit += f" · ~₹{int(row['Est_Fare'])}"
         title = (
             f"#{i + 1}  ·  via {row['Via_Station']} ({row['Via_Code']})  ·  "
             f"{format_duration(row['Total_Hrs'])} total  ·  "
-            f"wait {format_duration(row['Layover_Hrs'])}"
+            f"wait {format_duration(row['Layover_Hrs'])}{seat_bit}"
         )
         with st.expander(title, expanded=(i < 2)):
             c1, c2, c3, c4 = st.columns(4)
@@ -791,11 +1037,26 @@ def render_connection_cards(
             c4.metric("Night wait", "Yes" if overnight else "No")
 
             color = comfort_color(str(comfort), dark)
+            start_from = row.get("Start_From") or start_label
+            end_at = row.get("End_At") or end_label
+            board_on = row.get("Board_On") or ""
+            board_html = (
+                f"<div class='tc-muted' style='margin-bottom:6px;'>Board on: <b>{board_on}</b></div>"
+                if board_on
+                else ""
+            )
+            also_ok = str(row.get("Also_OK_On") or "").strip()
+            also_html = (
+                f"<div class='tc-muted' style='margin-top:4px;font-size:12px;'>Also OK on: {also_ok}</div>"
+                if also_ok
+                else ""
+            )
             st.markdown(
                 f"""
                 <div class="tc-route-box" style="--route-color:{color};">
+                  {board_html}
                   <div class="tc-muted" style="margin-bottom:6px;">
-                    {start_label} → <b>{row['Via_Station']}</b> → {end_label}
+                    {start_from} → <b>{row['Via_Station']}</b> → {end_at}
                   </div>
                   <div style="display:flex; flex-wrap:wrap; gap:18px; font-size:14px;">
                     <div>
@@ -814,6 +1075,7 @@ def render_connection_cards(
                       <div class="tc-muted" style="font-size:12px;">Runs: {row['Train_2_Running_Days']}</div>
                     </div>
                   </div>
+                  {also_html}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -825,15 +1087,14 @@ def render_connection_cards(
                     "(because of wait time or overnight)."
                 )
 
-            cache_key = (
-                f"{start_code}|{row['Via_Code']}|{end_code}|"
-                f"{row['Train_1_No']}|{row['Train_2_No']}|"
-                f"{search_date}|{quota}|{row.get('Train2_Day_Offset', 0)}"
-            )
+            board_date = _parse_board_date(row) or search_date
+            leg_start = extract_code(str(row.get("Start_From") or "")) or start_code
+            leg_end = extract_code(str(row.get("End_At") or "")) or end_code
+            cache_key = connection_cache_key(row, start_code, end_code, search_date, quota)
 
             seat_col = st.columns(1)[0]
             with seat_col:
-                scrape_disabled = search_date is None
+                scrape_disabled = board_date is None
                 if st.button(
                     "Check seats (both trains)",
                     key=f"seats_{i}_{row['Train_1_No']}_{row['Train_2_No']}",
@@ -843,21 +1104,21 @@ def render_connection_cards(
                 ):
                     with st.spinner("Getting seats for both trains…"):
                         raw = fetch_connection_availability(
-                            start_code=start_code,
+                            start_code=leg_start,
                             via_code=str(row["Via_Code"]),
-                            end_code=end_code,
+                            end_code=leg_end,
                             train1_no=str(row["Train_1_No"]),
                             train2_no=str(row["Train_2_No"]),
-                            journey_date=search_date,
+                            journey_date=board_date,
                             train2_day_offset=int(row.get("Train2_Day_Offset", 0) or 0),
                             quota=quota,
                         )
-                        date2 = search_date + datetime.timedelta(
+                        date2 = board_date + datetime.timedelta(
                             days=int(row.get("Train2_Day_Offset", 0) or 0)
                         )
                         raw["leg1"] = _enrich_seat_result(
                             raw.get("leg1") or {},
-                            search_date,
+                            board_date,
                             str(row.get("Leave_Start") or ""),
                         )
                         raw["leg2"] = _enrich_seat_result(
@@ -869,9 +1130,9 @@ def render_connection_cards(
                     st.rerun()
                 if scrape_disabled:
                     st.caption("Choose a travel date above to check seats.")
-                elif search_date:
+                elif board_date:
                     st.caption(
-                        f"Will scrape seats for **{search_date.strftime('%a %d %b %Y')}** "
+                        f"Will scrape seats for **{board_date.strftime('%a %d %b %Y')}** "
                         f"(Train 1) and matching date for Train 2."
                     )
 
@@ -880,17 +1141,27 @@ def render_connection_cards(
                 st.markdown("##### Seats for both trains")
                 a, b = st.columns(2)
                 with a:
-                    render_seat_block(seat_data.get("leg1") or {}, "Train 1")
+                    render_seat_block(seat_data.get("leg1") or {}, "Train 1", pref_classes=pref_classes)
                 with b:
-                    render_seat_block(seat_data.get("leg2") or {}, "Train 2")
+                    render_seat_block(seat_data.get("leg2") or {}, "Train 2", pref_classes=pref_classes)
+                scored = score_connection_seats(seat_data, pref_classes)
+                if scored["seat_score"] >= 0:
+                    fare_txt = (
+                        f" · est. ₹{int(scored['est_fare'])}"
+                        if scored.get("est_fare") is not None
+                        else ""
+                    )
+                    st.caption(
+                        f"Seat score (both legs): **{scored['seat_score']:.0f}/100**{fare_txt}"
+                    )
                 st.caption(
                     "Seat info is live from ConfirmTkt. Always confirm on IRCTC before booking."
                 )
 
 
 @st.cache_data(show_spinner=False)
-def cached_via_options(start_code, end_code):
-    return get_possible_via_stations(start_code, end_code)
+def cached_via_options(start_code, end_code, include_nearby=False):
+    return get_possible_via_stations(start_code, end_code, include_nearby=include_nearby)
 
 
 @st.cache_data(show_spinner=False)
@@ -899,13 +1170,14 @@ def cached_search_trains(query):
 
 
 @st.cache_data(show_spinner=False)
-def cached_hubs(start_code, end_code):
-    return get_top_via_hubs(start_code, end_code)
+def cached_hubs(start_code, end_code, include_nearby=False):
+    return get_top_via_hubs(start_code, end_code, include_nearby=include_nearby)
 
 
 # =====================================================================================
 # HEADER + THEME TOGGLE
 # =====================================================================================
+bootstrap_from_query_params()
 apply_theme_css(st.session_state.theme)
 dark = st.session_state.theme == "dark"
 
@@ -997,6 +1269,7 @@ with tab_connect:
     with dcol1:
         use_date = st.toggle("Use travel date", value=True, key="conn_use_date")
         search_date = None
+        conn_flex = 0
         if use_date:
             search_date = st.date_input(
                 "Travel date",
@@ -1006,11 +1279,24 @@ with tab_connect:
                 key="conn_travel_date",
                 label_visibility="collapsed",
             )
+            conn_flexible = st.toggle(
+                "Flexible dates (±3 days)",
+                value=False,
+                key="conn_flex_on",
+                help="Also show connections that work up to 3 days before or after your date.",
+            )
+            conn_flex = 3 if conn_flexible else 0
     with dcol2:
         if use_date and search_date:
             st.metric("Weekday", search_date.strftime("%A"))
         else:
             st.metric("Weekday", "Any day")
+        include_nearby = st.toggle(
+            "Include nearby stations",
+            value=False,
+            key="conn_nearby",
+            help="Also search alternate terminals in the same city (e.g. NDLS ↔ NZM ↔ ANVT).",
+        )
     with dcol3:
         quota = st.selectbox(
             "Quota (for seats)",
@@ -1019,6 +1305,28 @@ with tab_connect:
             help="Used when checking seats for both trains.",
             key="conn_quota",
         )
+        pref_classes = st.multiselect(
+            "Preferred class",
+            options=TRAVEL_CLASSES,
+            default=[],
+            key="conn_pref_classes",
+            help="Filter seat pills and score routes by these classes (e.g. 3A, SL).",
+        )
+
+    if include_nearby and s_code_live:
+        near = get_nearby_station_codes(s_code_live, include_nearby=True)
+        if len(near) > 1:
+            st.caption(
+                "Nearby from: "
+                + ", ".join(nearby_station_labels(s_code_live)[:8])
+            )
+    if include_nearby and e_code_live:
+        near_e = get_nearby_station_codes(e_code_live, include_nearby=True)
+        if len(near_e) > 1:
+            st.caption(
+                "Nearby to: "
+                + ", ".join(nearby_station_labels(e_code_live)[:8])
+            )
 
     with st.expander("Advanced filters", expanded=False):
         col3, col4 = st.columns(2)
@@ -1031,7 +1339,9 @@ with tab_connect:
             if use_via:
                 smart_via_list = []
                 if s_code_live and e_code_live and s_code_live != e_code_live:
-                    smart_via_list = cached_via_options(s_code_live, e_code_live)
+                    smart_via_list = cached_via_options(
+                        s_code_live, e_code_live, include_nearby=include_nearby
+                    )
                 if smart_via_list:
                     via_station = st.selectbox(
                         "Select Mid-Station",
@@ -1089,13 +1399,22 @@ with tab_connect:
         with col7:
             sort_choice = st.radio(
                 "Sort results by",
-                options=["Fastest total journey", "Shortest wait", "Earliest departure"],
+                options=[
+                    "Fastest total journey",
+                    "Shortest wait",
+                    "Earliest departure",
+                    "Best seats (after check)",
+                    "Cheapest (after check)",
+                ],
                 index=0,
+                key="conn_sort_choice",
             )
             sort_by = {
                 "Fastest total journey": "fastest",
                 "Shortest wait": "layover",
                 "Earliest departure": "departure",
+                "Best seats (after check)": "seats",
+                "Cheapest (after check)": "fare",
             }[sort_choice]
         with col8:
             exclude_overnight = st.checkbox(
@@ -1122,6 +1441,7 @@ with tab_connect:
         elif start_station == end_station:
             st.warning("Departure and Arrival stations cannot be the same.")
         else:
+            engine_sort = sort_by if sort_by in ("fastest", "layover", "departure") else "fastest"
             with st.spinner("Searching connecting routes..."):
                 s_code = extract_code(start_station)
                 e_code = extract_code(end_station)
@@ -1131,7 +1451,8 @@ with tab_connect:
                     s_code,
                     e_code,
                     search_date=search_date,
-                    flexible_days=0,  # exact travel date only (not ±3)
+                    flexible_days=conn_flex,
+                    include_nearby=include_nearby,
                 )
                 results = find_connections_pro(
                     start_code=s_code,
@@ -1144,13 +1465,14 @@ with tab_connect:
                     pref_arr_after=arr_after,
                     pref_arr_before=arr_before,
                     search_date=search_date,
-                    sort_by=sort_by,
+                    flexible_days=conn_flex,
+                    include_nearby=include_nearby,
+                    sort_by=engine_sort,
                     exclude_overnight=exclude_overnight,
                     max_results=int(max_results),
                 )
 
-            st.session_state.conn_results = results
-            st.session_state.conn_meta = {
+            meta = {
                 "start_station": start_station,
                 "end_station": end_station,
                 "s_code": s_code,
@@ -1158,23 +1480,33 @@ with tab_connect:
                 "search_date": search_date,
                 "quota": quota,
                 "view_mode": view_mode,
+                "sort_by": sort_by,
+                "pref_classes": list(pref_classes or []),
+                "include_nearby": bool(include_nearby),
+                "flexible": bool(conn_flex),
                 "direct_count": 0 if directs is None or directs.empty else len(directs),
             }
+            st.session_state.conn_results = results
+            st.session_state.conn_meta = meta
             st.session_state.conn_directs = (
                 None if directs is None or directs.empty else directs
             )
             st.session_state.show_direct_from_conn = False
             st.session_state.seat_cache = {}
             st.session_state.direct_seat_cache = {}
+            update_search_query_params(meta)
 
     meta = st.session_state.conn_meta or {}
     results = st.session_state.conn_results
+    pref_classes_meta = meta.get("pref_classes") or pref_classes or []
+    sort_by_meta = meta.get("sort_by") or "fastest"
 
     if results is not None:
         if meta.get("direct_count"):
             st.info(
                 f"**{meta['direct_count']} direct train(s)** also run between these stations "
-                "on your selected travel date (exact date — not flexible)."
+                "on your selected travel date"
+                + (" (± flexible days)." if meta.get("flexible") else " (exact / best nearby date).")
             )
             if st.button(
                 "View direct trains & check seats →",
@@ -1188,7 +1520,9 @@ with tab_connect:
                 if meta.get("search_date"):
                     st.session_state["direct_date_on"] = True
                     st.session_state["direct_date"] = meta["search_date"]
-                    st.session_state["direct_flex_on"] = False  # same exact date as connections
+                    st.session_state["direct_flex_on"] = bool(meta.get("flexible"))
+                st.session_state["direct_nearby"] = bool(meta.get("include_nearby"))
+                st.session_state["direct_pref_classes"] = list(pref_classes_meta)
                 st.session_state.direct_results = st.session_state.get("conn_directs")
                 st.session_state.direct_meta = {
                     "start_station": meta.get("start_station"),
@@ -1197,7 +1531,9 @@ with tab_connect:
                     "e_code": meta.get("e_code"),
                     "search_date": meta.get("search_date"),
                     "quota": meta.get("quota") or "GN",
-                    "flexible": False,
+                    "flexible": bool(meta.get("flexible")),
+                    "include_nearby": bool(meta.get("include_nearby")),
+                    "pref_classes": list(pref_classes_meta),
                 }
                 st.rerun()
 
@@ -1210,6 +1546,7 @@ with tab_connect:
                     meta["end_station"],
                     quota=meta.get("quota") or "GN",
                     key_prefix="conn_direct",
+                    pref_classes=pref_classes_meta,
                 )
                 st.caption("Tip: the same search is also saved under the **Direct Trains** tab.")
 
@@ -1217,9 +1554,22 @@ with tab_connect:
             st.warning(
                 "No connections found matching your filters. "
                 "Try widening the wait time, allowing overnight waits, "
-                    "or clearing time/date filters."
-                )
+                "turning on nearby stations / flexible dates, "
+                "or clearing time/date filters."
+            )
         else:
+            # Refresh seat scores from cache, then sort
+            results = apply_seat_scores_to_results(
+                results,
+                meta["s_code"],
+                meta["e_code"],
+                meta.get("search_date"),
+                meta.get("quota") or "GN",
+                pref_classes_meta,
+            )
+            results = sort_results_df(results, sort_by_meta)
+            st.session_state.conn_results = results
+
             st.success(f"Found {len(results)} optimized connection(s)!")
 
             fastest_time = results["Total_Hrs"].min()
@@ -1231,6 +1581,113 @@ with tab_connect:
             m2.metric("Fastest", format_duration(fastest_time))
             m3.metric("Shortest wait", format_duration(best_layover))
             m4.metric("Via hubs", via_count)
+
+            # Share + export + bulk seat check
+            share = build_share_url(meta)
+            x1, x2, x3 = st.columns(3)
+            with x1:
+                st.download_button(
+                    "Download CSV",
+                    data=results.to_csv(index=False).encode("utf-8"),
+                    file_name=(
+                        f"connections_{meta.get('s_code', 'from')}_"
+                        f"{meta.get('e_code', 'to')}.csv"
+                    ),
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="conn_csv_dl",
+                )
+            with x2:
+                itinerary = format_connection_itinerary(
+                    results,
+                    meta.get("start_station", ""),
+                    meta.get("end_station", ""),
+                    limit=5,
+                )
+                st.download_button(
+                    "Download itinerary (.txt)",
+                    data=itinerary.encode("utf-8"),
+                    file_name="train_connector_itinerary.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="conn_itin_dl",
+                )
+            with x3:
+                bulk_disabled = meta.get("search_date") is None
+                if st.button(
+                    "Check seats for top 5",
+                    use_container_width=True,
+                    disabled=bulk_disabled,
+                    key="bulk_seat_top5",
+                    help="Fetches seats for the first 5 routes so you can sort by availability or fare.",
+                ):
+                    with st.spinner("Checking seats for top 5 connections…"):
+                        for _, row in results.head(5).iterrows():
+                            key = connection_cache_key(
+                                row,
+                                meta["s_code"],
+                                meta["e_code"],
+                                meta.get("search_date"),
+                                meta.get("quota") or "GN",
+                            )
+                            if key in st.session_state.seat_cache:
+                                continue
+                            board_date = _parse_board_date(row) or meta.get("search_date")
+                            if board_date is None:
+                                continue
+                            leg_start = extract_code(str(row.get("Start_From") or "")) or meta["s_code"]
+                            leg_end = extract_code(str(row.get("End_At") or "")) or meta["e_code"]
+                            raw = fetch_connection_availability(
+                                start_code=leg_start,
+                                via_code=str(row["Via_Code"]),
+                                end_code=leg_end,
+                                train1_no=str(row["Train_1_No"]),
+                                train2_no=str(row["Train_2_No"]),
+                                journey_date=board_date,
+                                train2_day_offset=int(row.get("Train2_Day_Offset", 0) or 0),
+                                quota=meta.get("quota") or "GN",
+                            )
+                            date2 = board_date + datetime.timedelta(
+                                days=int(row.get("Train2_Day_Offset", 0) or 0)
+                            )
+                            raw["leg1"] = _enrich_seat_result(
+                                raw.get("leg1") or {},
+                                board_date,
+                                str(row.get("Leave_Start") or ""),
+                            )
+                            raw["leg2"] = _enrich_seat_result(
+                                raw.get("leg2") or {},
+                                date2,
+                                str(row.get("Leave_Mid") or ""),
+                            )
+                            st.session_state.seat_cache[key] = raw
+                    st.rerun()
+
+            if share:
+                st.text_input(
+                    "Shareable search link (copy from address bar, or use this query)",
+                    value=share,
+                    key="conn_share_link",
+                    help="Open this app with these query params to restore the search.",
+                )
+            with st.expander("Copy itinerary text"):
+                st.code(
+                    format_connection_itinerary(
+                        results,
+                        meta.get("start_station", ""),
+                        meta.get("end_station", ""),
+                        limit=5,
+                    ),
+                    language=None,
+                )
+
+            if sort_by_meta in ("seats", "fare") and (
+                "Seat_Score" not in results.columns or results["Seat_Score"].isna().all()
+            ):
+                st.info(
+                    "Seat / fare sorting needs live data — click **Check seats for top 5** first "
+                    "(or check individual routes)."
+                )
 
             if meta.get("search_date"):
                 unknown_count = (
@@ -1244,7 +1701,11 @@ with tab_connect:
                     )
 
             with st.expander("Top interchange hubs for this route"):
-                hubs = cached_hubs(meta["s_code"], meta["e_code"])
+                hubs = cached_hubs(
+                    meta["s_code"],
+                    meta["e_code"],
+                    include_nearby=bool(meta.get("include_nearby")),
+                )
                 if hubs.empty:
                     st.caption("No hub breakdown available.")
                 else:
@@ -1261,6 +1722,7 @@ with tab_connect:
                     meta.get("search_date"),
                     meta.get("quota") or "GN",
                     dark,
+                    pref_classes=pref_classes_meta,
                 )
 
             if view_mode in ("Cards + table", "Table only"):
@@ -1286,6 +1748,12 @@ with tab_connect:
                         "Overnight_Layover": st.column_config.TextColumn("Overnight"),
                         "Train_1_Running_Days": st.column_config.TextColumn("Train 1 Runs On"),
                         "Train_2_Running_Days": st.column_config.TextColumn("Train 2 Runs On"),
+                        "Seat_Score": st.column_config.NumberColumn(
+                            "Seat score", help="Higher = easier to confirm (after seat check)"
+                        ),
+                        "Est_Fare": st.column_config.NumberColumn(
+                            "Est. fare (₹)", format="%.0f"
+                        ),
                     },
                 )
 
@@ -1333,6 +1801,12 @@ with tab_direct:
                 help="Also show trains that work up to 3 days before or after your date.",
             )
             d_flex = 3 if d_flexible else 0
+        d_nearby = st.toggle(
+            "Include nearby stations",
+            value=False,
+            key="direct_nearby",
+            help="Also search alternate terminals in the same city.",
+        )
     with d4:
         d_sort = st.radio(
             "Sort by",
@@ -1347,6 +1821,11 @@ with tab_direct:
             index=0,
             key="direct_quota",
         )
+        d_pref_classes = st.multiselect(
+            "Preferred class",
+            options=TRAVEL_CLASSES,
+            key="direct_pref_classes",
+        )
 
     if st.button("Search direct trains", type="primary", use_container_width=True, key="direct_btn"):
         if not d_start or not d_end:
@@ -1360,6 +1839,7 @@ with tab_direct:
                     extract_code(d_end),
                     search_date=d_date,
                     flexible_days=d_flex if d_use_date else 0,
+                    include_nearby=d_nearby,
                     sort_by=d_sort_by,
                 )
             st.session_state.direct_results = directs
@@ -1371,6 +1851,8 @@ with tab_direct:
                 "search_date": d_date,
                 "quota": d_quota,
                 "flexible": bool(d_flex),
+                "include_nearby": bool(d_nearby),
+                "pref_classes": list(d_pref_classes or []),
             }
             st.session_state.direct_seat_cache = {}
 
@@ -1386,6 +1868,17 @@ with tab_direct:
             m1.metric("Trains", len(directs))
             m2.metric("Fastest", format_duration(directs["Duration_Hrs"].min()))
 
+            st.download_button(
+                "Download CSV",
+                data=directs.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    f"direct_{d_meta.get('s_code', 'from')}_{d_meta.get('e_code', 'to')}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="direct_csv_dl",
+            )
+
             if d_meta.get("search_date"):
                 st.caption(
                     "Board on = date at your From station. "
@@ -1400,6 +1893,7 @@ with tab_direct:
                 d_meta.get("end_station") or d_end,
                 quota=d_meta.get("quota") or d_quota,
                 key_prefix="direct_tab",
+                pref_classes=d_meta.get("pref_classes") or d_pref_classes,
             )
 
 # =====================================================================================
@@ -1492,6 +1986,9 @@ st.info(
     """
 **Notes**
 - If running-day data is missing, the train is treated as running every day.
+- **Nearby stations** expand major metros (Delhi, Mumbai, Kolkata, Chennai, Bengaluru, Hyderabad).
+- **Preferred class** filters seat pills and powers Best seats / Cheapest sorting after a seat check.
+- Share a search with query params like `?from=NDLS&to=HWH&date=2026-08-25&nearby=1&class=3A,SL`.
 - Seat info comes from ConfirmTkt — always confirm on IRCTC before booking.
 - Prices and seats can change; this app is only for planning.
 """
