@@ -1,5 +1,7 @@
 import re
 import datetime
+from typing import Optional
+
 import pandas as pd
 
 # =====================================================================================
@@ -396,6 +398,10 @@ def irctc_train_url(train_number: str) -> str:
 
 def get_data_stats():
     """Coverage stats for the About / data tab."""
+    type_counts = {}
+    for _, name in TRAIN_INDEX:
+        t = classify_train_type(name)
+        type_counts[t] = type_counts.get(t, 0) + 1
     return {
         "trains": int(df2["train_number"].nunique()),
         "schedule_rows": int(len(df2)),
@@ -404,9 +410,169 @@ def get_data_stats():
         "running_days_known": sum(1 for v in RUNNING_DAYS_MAP.values() if v),
         "running_days_unknown": sum(1 for v in RUNNING_DAYS_MAP.values() if not v)
         + max(0, int(df2["train_number"].nunique()) - len(RUNNING_DAYS_MAP)),
+        "train_types": dict(sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))),
     }
 
 
+# =====================================================================================
+# TRAIN TYPE + HALT HELPERS
+# =====================================================================================
+TRAIN_TYPE_OPTIONS = [
+    "Vande Bharat",
+    "Rajdhani",
+    "Shatabdi",
+    "Duronto",
+    "Tejas",
+    "Humsafar",
+    "Garib Rath",
+    "Express",
+    "Superfast",
+    "Passenger",
+    "Other",
+]
+
+
+def classify_train_type(train_name: str) -> str:
+    """Best-effort type from train name (scraped names vary)."""
+    n = (train_name or "").upper()
+    if "VANDE" in n:
+        return "Vande Bharat"
+    if "RAJDHANI" in n or "RJDHNI" in n or "RAJDHNI" in n:
+        return "Rajdhani"
+    if "SHATABDI" in n:
+        return "Shatabdi"
+    if "DURONTO" in n:
+        return "Duronto"
+    if "TEJAS" in n:
+        return "Tejas"
+    if "HUMSAFAR" in n:
+        return "Humsafar"
+    if "GARIB" in n:
+        return "Garib Rath"
+    if "PASSENGER" in n or re.search(r"\bPASS\b", n):
+        return "Passenger"
+    if "SUPERFAST" in n or re.search(r"\bSF\b", n) or n.endswith(" SF"):
+        return "Superfast"
+    if "EXPRESS" in n or re.search(r"\bEXP\b", n) or n.endswith(" EXP"):
+        return "Express"
+    return "Other"
+
+
+def _train_type_ok(train_name: str, allowed_types) -> bool:
+    if not allowed_types:
+        return True
+    return classify_train_type(train_name) in set(allowed_types)
+
+
+# (train_number, station_code) -> halt minutes
+_HALT_CACHE = {}
+
+
+def _halt_minutes_at(train_number: str, station_code: str) -> Optional[float]:
+    key = (str(train_number), str(station_code).upper())
+    if key in _HALT_CACHE:
+        return _HALT_CACHE[key]
+    rows = df2[
+        (df2["train_number"] == str(train_number))
+        & (df2["station_code"] == str(station_code).upper())
+    ]
+    if rows.empty:
+        _HALT_CACHE[key] = None
+        return None
+    row = rows.iloc[0]
+    mins = (row["abs_departure"] - row["abs_arrival"]).total_seconds() / 60.0
+    if mins < 0:
+        mins = 0.0
+    _HALT_CACHE[key] = round(mins, 0)
+    return _HALT_CACHE[key]
+
+
+def change_warning_text(t1_halt, t2_halt, layover_hrs) -> str:
+    """Human warning when the interchange looks tight or rushed."""
+    notes = []
+    try:
+        lay = float(layover_hrs)
+    except (TypeError, ValueError):
+        lay = None
+    if t2_halt is not None and t2_halt <= 2:
+        notes.append(f"Train 2 only halts ~{int(t2_halt)} min — tight boarding")
+    elif t2_halt is not None and t2_halt <= 5:
+        notes.append(f"Train 2 short halt (~{int(t2_halt)} min)")
+    if t1_halt is not None and t1_halt <= 2:
+        notes.append(f"Train 1 short stop (~{int(t1_halt)} min)")
+    if lay is not None and lay < 1.0:
+        notes.append("Very short wait — delay risk")
+    return " · ".join(notes)
+
+
+def enrich_halt_warnings(results: pd.DataFrame) -> pd.DataFrame:
+    """Add halt minutes + Change_Warning for one-change results."""
+    if results is None or results.empty:
+        return results
+    out = results.copy()
+    if "Via_Code" not in out.columns:
+        return out
+    t1_halts, t2_halts, warns = [], [], []
+    for _, row in out.iterrows():
+        via = str(row.get("Via_Code") or "")
+        h1 = _halt_minutes_at(str(row.get("Train_1_No") or ""), via)
+        h2 = _halt_minutes_at(str(row.get("Train_2_No") or ""), via)
+        t1_halts.append(h1)
+        t2_halts.append(h2)
+        warns.append(change_warning_text(h1, h2, row.get("Layover_Hrs")))
+    out["Train_1_Halt_Min"] = t1_halts
+    out["Train_2_Halt_Min"] = t2_halts
+    out["Change_Warning"] = warns
+    return out
+
+
+def _normalize_code_list(codes) -> list:
+    if not codes:
+        return []
+    if isinstance(codes, str):
+        codes = [codes]
+    out = []
+    for c in codes:
+        c = (c or "").strip().upper()
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def _top_outbound_hubs(origin_codes, exclude_codes=None, limit=10) -> list:
+    """Stations most often reached after boarding at origin_codes."""
+    origin_codes = _normalize_code_list(origin_codes)
+    exclude = set(_normalize_code_list(exclude_codes)) | set(origin_codes)
+    if not origin_codes:
+        return []
+    origins = df2[df2["station_code"].isin(origin_codes)][
+        ["train_number", "stop_seq"]
+    ].rename(columns={"stop_seq": "o_seq"})
+    later = origins.merge(df2, on="train_number")
+    later = later[later["stop_seq"] > later["o_seq"]]
+    later = later[~later["station_code"].isin(exclude)]
+    if later.empty:
+        return []
+    counts = later.groupby("station_code").size().sort_values(ascending=False)
+    return list(counts.head(int(limit)).index)
+
+
+def _top_inbound_hubs(dest_codes, exclude_codes=None, limit=10) -> list:
+    """Stations most often left before arriving at dest_codes."""
+    dest_codes = _normalize_code_list(dest_codes)
+    exclude = set(_normalize_code_list(exclude_codes)) | set(dest_codes)
+    if not dest_codes:
+        return []
+    dests = df2[df2["station_code"].isin(dest_codes)][
+        ["train_number", "stop_seq"]
+    ].rename(columns={"stop_seq": "d_seq"})
+    earlier = dests.merge(df2, on="train_number")
+    earlier = earlier[earlier["stop_seq"] < earlier["d_seq"]]
+    earlier = earlier[~earlier["station_code"].isin(exclude)]
+    if earlier.empty:
+        return []
+    counts = earlier.groupby("station_code").size().sort_values(ascending=False)
+    return list(counts.head(int(limit)).index)
 # =====================================================================================
 # CORE SEARCH — CONNECTING TRAINS
 # =====================================================================================
@@ -426,6 +592,9 @@ def find_connections_pro(
     sort_by="fastest",         # "fastest" | "layover" | "departure"
     exclude_overnight=False,
     max_results=None,
+    train_types=None,          # list of classify_train_type labels
+    avoid_via_codes=None,      # never change here
+    prefer_via_codes=None,     # soft-prefer these hubs (sorted first)
 ):
     start_codes = get_nearby_station_codes(start_code, include_nearby=include_nearby)
     end_codes = get_nearby_station_codes(end_code, include_nearby=include_nearby)
@@ -437,7 +606,9 @@ def find_connections_pro(
     if not start_codes or not end_codes:
         return pd.DataFrame()
 
-    # 1. LEG 1 (start -> mid)
+    avoid_set = set(_normalize_code_list(avoid_via_codes))
+    prefer_set = set(_normalize_code_list(prefer_via_codes))
+    # Pin via_code still wins as hard filter later; prefer list is soft.
     starts = df2[df2["station_code"].isin(start_codes)][
         ["train_number", "stop_seq", "abs_departure", "departure", "train_name", "day", "station_code"]
     ]
@@ -542,6 +713,14 @@ def find_connections_pro(
 
     if via_code is not None:
         connections = connections[connections["station_c"] == via_code]
+    if avoid_set:
+        connections = connections[~connections["station_c"].isin(avoid_set)]
+    # prefer_via_codes is soft — applied later via sort key _via_pref
+
+    if train_types:
+        t1_ok = connections["train1_name"].apply(lambda n: _train_type_ok(n, train_types))
+        t2_ok = connections["train2_name"].apply(lambda n: _train_type_ok(n, train_types))
+        connections = connections[t1_ok & t2_ok]
 
     if connections.empty:
         return pd.DataFrame()
@@ -654,8 +833,9 @@ def find_connections_pro(
     # Prefer exact requested stations when nearby search is on
     valid_routes["_start_pref"] = (valid_routes["start_from"] != start_code).astype(int)
     valid_routes["_end_pref"] = (valid_routes["end_at"] != end_code).astype(int)
+    valid_routes["_via_pref"] = (~valid_routes["station_c"].isin(prefer_set)).astype(int) if prefer_set else 0
     valid_routes = valid_routes.sort_values(
-        ["_start_pref", "_end_pref", sort_col]
+        ["_via_pref", "_start_pref", "_end_pref", sort_col]
     )
     valid_routes = valid_routes.drop_duplicates(subset=["train1", "train2"], keep="first")
 
@@ -687,6 +867,9 @@ def find_connections_pro(
 
     final_output["Train_1_Running_Days"] = final_output["train1"].apply(running_days_text)
     final_output["Train_2_Running_Days"] = final_output["train2"].apply(running_days_text)
+    final_output["Train_1_Type"] = final_output["train1_name"].apply(classify_train_type)
+    final_output["Train_2_Type"] = final_output["train2_name"].apply(classify_train_type)
+    final_output["Changes"] = 1
     final_output["Comfort"] = final_output["layover_hours"].apply(comfort_label)
     final_output["Overnight_Layover"] = [
         "Yes" if (cm or is_overnight_layover(a, d)) else "No"
@@ -704,6 +887,22 @@ def find_connections_pro(
     )
     final_output["Start_From"] = final_output["start_from"].apply(station_label)
     final_output["End_At"] = final_output["end_at"].apply(station_label)
+
+    # Halt warnings at the interchange
+    final_output["Train_1_Halt_Min"] = [
+        _halt_minutes_at(t, v) for t, v in zip(final_output["train1"], final_output["station_c"])
+    ]
+    final_output["Train_2_Halt_Min"] = [
+        _halt_minutes_at(t, v) for t, v in zip(final_output["train2"], final_output["station_c"])
+    ]
+    final_output["Change_Warning"] = [
+        change_warning_text(h1, h2, lay)
+        for h1, h2, lay in zip(
+            final_output["Train_1_Halt_Min"],
+            final_output["Train_2_Halt_Min"],
+            final_output["layover_hours"],
+        )
+    ]
 
     final_output = final_output.rename(
         columns={
@@ -731,23 +930,29 @@ def find_connections_pro(
     final_output["Total_Hrs"] = final_output["Total_Hrs"].round(1)
 
     display_cols = [
+        "Changes",
         "Start_From",
         "End_At",
         "Via_Station",
         "Via_Code",
         "Train_1_No",
         "Train_1_Name",
+        "Train_1_Type",
         "Leave_Start",
         "Arrive_Mid",
         "Leg1_Hrs",
+        "Train_1_Halt_Min",
         "Train_2_No",
         "Train_2_Name",
+        "Train_2_Type",
         "Leave_Mid",
         "Arrive_End",
         "Leg2_Hrs",
+        "Train_2_Halt_Min",
         "Layover_Hrs",
         "Total_Hrs",
         "Comfort",
+        "Change_Warning",
         "Overnight_Layover",
         "Train_1_Running_Days",
         "Train_2_Running_Days",
@@ -803,6 +1008,394 @@ def get_possible_via_stations(start_code, end_code, include_nearby=False):
     return options
 
 
+def find_two_change_connections(
+    start_code,
+    end_code,
+    min_layover_hrs=1.0,
+    max_layover_hrs=8.0,
+    max_total_hrs=48.0,
+    search_date=None,
+    flexible_days=0,
+    include_nearby=False,
+    train_types=None,
+    avoid_via_codes=None,
+    hub_limit=6,
+    max_results=25,
+    sort_by="fastest",
+):
+    """
+    Optional 2-change (3-train) routes: start → via1 → via2 → end.
+
+    Hub candidates are capped (hub_limit) so the search stays tractable.
+    """
+    start_codes = get_nearby_station_codes(start_code, include_nearby=include_nearby)
+    end_codes = get_nearby_station_codes(end_code, include_nearby=include_nearby)
+    if set(start_codes) & set(end_codes):
+        start_codes = [(start_code or "").strip().upper()]
+        end_codes = [(end_code or "").strip().upper()]
+    end_codes = [c for c in end_codes if c and c not in start_codes]
+    if not start_codes or not end_codes:
+        return pd.DataFrame()
+
+    avoid_set = set(_normalize_code_list(avoid_via_codes))
+    via1_list = [
+        c
+        for c in _top_outbound_hubs(start_codes, end_codes, limit=hub_limit)
+        if c not in avoid_set
+    ]
+    via2_list = [
+        c
+        for c in _top_inbound_hubs(end_codes, start_codes, limit=hub_limit)
+        if c not in avoid_set
+    ]
+    if not via1_list or not via2_list:
+        return pd.DataFrame()
+
+    # --- Leg A: start → via1 ---
+    a_board = df2[df2["station_code"].isin(start_codes)][
+        ["train_number", "train_name", "stop_seq", "abs_departure", "departure", "day", "station_code"]
+    ].rename(
+        columns={
+            "stop_seq": "a_seq",
+            "abs_departure": "a_abs_dep",
+            "departure": "leave_start",
+            "day": "train1_start_day",
+            "station_code": "start_from",
+            "train_name": "train1_name",
+        }
+    )
+    leg_a = a_board.merge(df2, on="train_number")
+    leg_a = leg_a[
+        (leg_a["stop_seq"] > leg_a["a_seq"]) & (leg_a["station_code"].isin(via1_list))
+    ]
+    leg_a["t1_hrs"] = (leg_a["abs_arrival"] - leg_a["a_abs_dep"]).dt.total_seconds() / 3600
+    leg_a = leg_a[leg_a["t1_hrs"] > 0]
+    if train_types:
+        leg_a = leg_a[leg_a["train1_name"].apply(lambda n: _train_type_ok(n, train_types))]
+    leg_a = leg_a[
+        [
+            "train_number",
+            "train1_name",
+            "leave_start",
+            "arrival",
+            "t1_hrs",
+            "train1_start_day",
+            "day",
+            "start_from",
+            "station_code",
+            "station_name",
+        ]
+    ].rename(
+        columns={
+            "train_number": "train1",
+            "arrival": "arr_via1",
+            "day": "train1_via1_day",
+            "station_code": "via1",
+            "station_name": "via1_name",
+        }
+    )
+    if leg_a.empty:
+        return pd.DataFrame()
+
+    # --- Leg B: via1 → via2 ---
+    b_board = df2[df2["station_code"].isin(via1_list)][
+        ["train_number", "train_name", "stop_seq", "abs_departure", "departure", "day", "station_code"]
+    ].rename(
+        columns={
+            "stop_seq": "b_seq",
+            "abs_departure": "b_abs_dep",
+            "departure": "leave_via1",
+            "day": "train2_via1_day",
+            "station_code": "via1",
+            "train_name": "train2_name",
+        }
+    )
+    leg_b = b_board.merge(df2, on="train_number")
+    leg_b = leg_b[
+        (leg_b["stop_seq"] > leg_b["b_seq"]) & (leg_b["station_code"].isin(via2_list))
+    ]
+    leg_b = leg_b[leg_b["via1"] != leg_b["station_code"]]
+    leg_b["t2_hrs"] = (leg_b["abs_arrival"] - leg_b["b_abs_dep"]).dt.total_seconds() / 3600
+    leg_b = leg_b[leg_b["t2_hrs"] > 0]
+    if train_types:
+        leg_b = leg_b[leg_b["train2_name"].apply(lambda n: _train_type_ok(n, train_types))]
+    leg_b = leg_b[
+        [
+            "train_number",
+            "train2_name",
+            "leave_via1",
+            "arrival",
+            "t2_hrs",
+            "train2_via1_day",
+            "day",
+            "via1",
+            "station_code",
+            "station_name",
+        ]
+    ].rename(
+        columns={
+            "train_number": "train2",
+            "arrival": "arr_via2",
+            "day": "train2_via2_day",
+            "station_code": "via2",
+            "station_name": "via2_name",
+        }
+    )
+    if leg_b.empty:
+        return pd.DataFrame()
+
+    # --- Leg C: via2 → end ---
+    c_arr = df2[df2["station_code"].isin(end_codes)][
+        ["train_number", "train_name", "stop_seq", "abs_arrival", "arrival", "station_code"]
+    ].rename(
+        columns={
+            "stop_seq": "c_seq",
+            "abs_arrival": "c_abs_arr",
+            "arrival": "arrive_end",
+            "station_code": "end_at",
+            "train_name": "train3_name",
+        }
+    )
+    leg_c = c_arr.merge(df2, on="train_number")
+    leg_c = leg_c[
+        (leg_c["stop_seq"] < leg_c["c_seq"]) & (leg_c["station_code"].isin(via2_list))
+    ]
+    leg_c["t3_hrs"] = (leg_c["c_abs_arr"] - leg_c["abs_departure"]).dt.total_seconds() / 3600
+    leg_c = leg_c[leg_c["t3_hrs"] > 0]
+    if train_types:
+        leg_c = leg_c[leg_c["train3_name"].apply(lambda n: _train_type_ok(n, train_types))]
+    leg_c = leg_c[
+        [
+            "train_number",
+            "train3_name",
+            "departure",
+            "arrive_end",
+            "t3_hrs",
+            "day",
+            "station_code",
+            "end_at",
+        ]
+    ].rename(
+        columns={
+            "train_number": "train3",
+            "departure": "leave_via2",
+            "day": "train3_via2_day",
+            "station_code": "via2",
+        }
+    )
+    if leg_c.empty:
+        return pd.DataFrame()
+
+    # Join A-B on via1, then B-C on via2
+    ab = leg_a.merge(leg_b, on="via1")
+    ab = ab[
+        (ab["train1"] != ab["train2"])
+        & (ab["train1_name"] != ab["train2_name"])
+    ]
+    if ab.empty:
+        return pd.DataFrame()
+
+    routes = ab.merge(leg_c, on="via2")
+    routes = routes[
+        (routes["train2"] != routes["train3"])
+        & (routes["train3"] != routes["train1"])
+        & (routes["train2_name"] != routes["train3_name"])
+        & (routes["via1"] != routes["via2"])
+    ]
+    if routes.empty:
+        return pd.DataFrame()
+
+    # Layover 1 at via1
+    routes["arr1"] = pd.to_timedelta(routes["arr_via1"])
+    routes["dep1"] = pd.to_timedelta(routes["leave_via1"])
+    cross1 = routes["dep1"] < routes["arr1"]
+    routes.loc[cross1, "dep1"] += pd.Timedelta(days=1)
+    routes["lay1"] = (routes["dep1"] - routes["arr1"]).dt.total_seconds() / 3600
+
+    # Layover 2 at via2
+    routes["arr2"] = pd.to_timedelta(routes["arr_via2"])
+    routes["dep2"] = pd.to_timedelta(routes["leave_via2"])
+    cross2 = routes["dep2"] < routes["arr2"]
+    routes.loc[cross2, "dep2"] += pd.Timedelta(days=1)
+    routes["lay2"] = (routes["dep2"] - routes["arr2"]).dt.total_seconds() / 3600
+
+    routes["total_hrs"] = (
+        routes["t1_hrs"] + routes["lay1"] + routes["t2_hrs"] + routes["lay2"] + routes["t3_hrs"]
+    )
+    routes = routes[
+        (routes["lay1"] >= min_layover_hrs)
+        & (routes["lay1"] <= max_layover_hrs)
+        & (routes["lay2"] >= min_layover_hrs)
+        & (routes["lay2"] <= max_layover_hrs)
+        & (routes["total_hrs"] <= max_total_hrs)
+    ]
+    if routes.empty:
+        return pd.DataFrame()
+
+    # Date filter (train1 / train2 / train3 origin weekdays)
+    if search_date is not None:
+        flex = max(0, int(flexible_days or 0))
+        candidate_dates = [
+            search_date + datetime.timedelta(days=delta) for delta in range(-flex, flex + 1)
+        ]
+        kept = []
+        for row in routes.itertuples(index=False):
+            matching = []
+            for d in candidate_dates:
+                wd0 = d.weekday()
+                if not train_runs_on(
+                    row.train1, origin_weekday_for_boarding(wd0, row.train1_start_day)
+                ):
+                    continue
+                off2 = int((row.t1_hrs + row.lay1) // 24)
+                wd2 = (wd0 + off2) % 7
+                if not train_runs_on(
+                    row.train2, origin_weekday_for_boarding(wd2, row.train2_via1_day)
+                ):
+                    continue
+                off3 = int((row.t1_hrs + row.lay1 + row.t2_hrs + row.lay2) // 24)
+                wd3 = (wd0 + off3) % 7
+                if not train_runs_on(
+                    row.train3, origin_weekday_for_boarding(wd3, row.train3_via2_day)
+                ):
+                    continue
+                matching.append((d, off2, off3))
+            if not matching:
+                continue
+            best = min(matching, key=lambda x: (abs((x[0] - search_date).days), x[0].toordinal()))
+            kept.append(
+                {
+                    "via1": row.via1,
+                    "via1_name": row.via1_name,
+                    "via2": row.via2,
+                    "via2_name": row.via2_name,
+                    "train1": row.train1,
+                    "train1_name": row.train1_name,
+                    "leave_start": row.leave_start,
+                    "arr_via1": row.arr_via1,
+                    "t1_hrs": row.t1_hrs,
+                    "lay1": row.lay1,
+                    "train2": row.train2,
+                    "train2_name": row.train2_name,
+                    "leave_via1": row.leave_via1,
+                    "arr_via2": row.arr_via2,
+                    "t2_hrs": row.t2_hrs,
+                    "lay2": row.lay2,
+                    "train3": row.train3,
+                    "train3_name": row.train3_name,
+                    "leave_via2": row.leave_via2,
+                    "arrive_end": row.arrive_end,
+                    "t3_hrs": row.t3_hrs,
+                    "total_hrs": row.total_hrs,
+                    "start_from": row.start_from,
+                    "end_at": row.end_at,
+                    "boarding_date": best[0],
+                    "train2_day_offset": best[1],
+                    "train3_day_offset": best[2],
+                }
+            )
+        routes = pd.DataFrame(kept)
+        if routes.empty:
+            return pd.DataFrame()
+    else:
+        routes = routes.copy()
+        routes["boarding_date"] = None
+        routes["train2_day_offset"] = (routes["t1_hrs"] + routes["lay1"]).floordiv(24).astype(int)
+        routes["train3_day_offset"] = (
+            (routes["t1_hrs"] + routes["lay1"] + routes["t2_hrs"] + routes["lay2"])
+            .floordiv(24)
+            .astype(int)
+        )
+
+    routes = routes.sort_values("total_hrs").drop_duplicates(
+        subset=["train1", "train2", "train3"], keep="first"
+    )
+
+    out = pd.DataFrame(
+        {
+            "Changes": 2,
+            "Start_From": routes["start_from"].apply(station_label),
+            "End_At": routes["end_at"].apply(station_label),
+            "Via_Station": [
+                f"{a} → {b}" for a, b in zip(routes["via1_name"], routes["via2_name"])
+            ],
+            "Via_Code": [
+                f"{a}+{b}" for a, b in zip(routes["via1"], routes["via2"])
+            ],
+            "Via1_Code": routes["via1"].values,
+            "Via2_Code": routes["via2"].values,
+            "Train_1_No": routes["train1"].values,
+            "Train_1_Name": routes["train1_name"].values,
+            "Train_1_Type": [classify_train_type(n) for n in routes["train1_name"]],
+            "Leave_Start": routes["leave_start"].apply(format_time).values,
+            "Arrive_Mid": routes["arr_via1"].apply(format_time).values,
+            "Leg1_Hrs": routes["t1_hrs"].round(1).values,
+            "Layover1_Hrs": routes["lay1"].round(1).values,
+            "Train_2_No": routes["train2"].values,
+            "Train_2_Name": routes["train2_name"].values,
+            "Train_2_Type": [classify_train_type(n) for n in routes["train2_name"]],
+            "Leave_Mid": routes["leave_via1"].apply(format_time).values,
+            "Arrive_Via2": routes["arr_via2"].apply(format_time).values,
+            "Leg2_Hrs": routes["t2_hrs"].round(1).values,
+            "Layover2_Hrs": routes["lay2"].round(1).values,
+            "Train_3_No": routes["train3"].values,
+            "Train_3_Name": routes["train3_name"].values,
+            "Train_3_Type": [classify_train_type(n) for n in routes["train3_name"]],
+            "Leave_Via2": routes["leave_via2"].apply(format_time).values,
+            "Arrive_End": routes["arrive_end"].apply(format_time).values,
+            "Leg3_Hrs": routes["t3_hrs"].round(1).values,
+            "Layover_Hrs": (routes["lay1"] + routes["lay2"]).round(1).values,
+            "Total_Hrs": routes["total_hrs"].round(1).values,
+            "Comfort": routes["lay1"].apply(comfort_label).values,
+            "Train_1_Running_Days": [running_days_text(t) for t in routes["train1"]],
+            "Train_2_Running_Days": [running_days_text(t) for t in routes["train2"]],
+            "Train_3_Running_Days": [running_days_text(t) for t in routes["train3"]],
+            "Train2_Day_Offset": routes["train2_day_offset"].values,
+            "Train3_Day_Offset": routes["train3_day_offset"].values,
+            "Board_Date": [
+                d.isoformat() if isinstance(d, datetime.date) else ""
+                for d in routes["boarding_date"]
+            ],
+            "Board_On": [
+                d.strftime("%a %d %b %Y") if isinstance(d, datetime.date) else ""
+                for d in routes["boarding_date"]
+            ],
+        }
+    )
+
+    # Halt warnings at both vias
+    warns = []
+    for _, row in out.iterrows():
+        h1 = _halt_minutes_at(row["Train_2_No"], row["Via1_Code"])
+        h2 = _halt_minutes_at(row["Train_3_No"], row["Via2_Code"])
+        w1 = change_warning_text(None, h1, row["Layover1_Hrs"])
+        w2 = change_warning_text(None, h2, row["Layover2_Hrs"])
+        parts = [p for p in (w1, w2) if p]
+        if parts:
+            warns.append(" | ".join(parts))
+        else:
+            warns.append("")
+    out["Change_Warning"] = warns
+    out["Overnight_Layover"] = [
+        "Yes" if (float(a) > 6 or float(b) > 6) else "No"
+        for a, b in zip(out["Layover1_Hrs"], out["Layover2_Hrs"])
+    ]
+
+    if search_date is None:
+        out = out.drop(columns=["Board_On", "Board_Date"], errors="ignore")
+
+    if out["Start_From"].nunique() <= 1 and out["End_At"].nunique() <= 1:
+        out = out.drop(columns=["Start_From", "End_At"], errors="ignore")
+
+    sort_col = {"fastest": "Total_Hrs", "layover": "Layover_Hrs", "departure": "Leave_Start"}.get(
+        sort_by, "Total_Hrs"
+    )
+    out = out.sort_values(sort_col).reset_index(drop=True)
+    if max_results:
+        out = out.head(int(max_results))
+    return out
+
+
 # =====================================================================================
 # DIRECT TRAINS (no change of train)
 # =====================================================================================
@@ -816,6 +1409,7 @@ def find_direct_trains(
     search_date=None,
     flexible_days=0,
     include_nearby=False,
+    train_types=None,
     sort_by="fastest",
 ):
     """
@@ -870,6 +1464,8 @@ def find_direct_trains(
         merged = merged[merged["arr_time"] >= pref_arr_after]
     if pref_arr_before is not None:
         merged = merged[merged["arr_time"] <= pref_arr_before]
+    if train_types and not merged.empty:
+        merged = merged[merged["train_name"].apply(lambda n: _train_type_ok(n, train_types))]
 
     if search_date is not None and not merged.empty:
         flex = max(0, int(flexible_days or 0))
@@ -931,11 +1527,13 @@ def find_direct_trains(
         subset=["train_number"], keep="first"
     )
     merged["Running_Days"] = merged["train_number"].apply(running_days_text)
+    merged["Train_Type"] = merged["train_name"].apply(classify_train_type)
     merged["Stops_Between"] = (merged["end_seq"] - merged["start_seq"] - 1).astype(int)
 
     out_cols = [
         "train_number",
         "train_name",
+        "Train_Type",
         "dep_time",
         "arr_time",
         "dep_day",

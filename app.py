@@ -7,6 +7,7 @@ import streamlit as st
 try:
     from engine import (
         find_connections_pro,
+        find_two_change_connections,
         find_direct_trains,
         get_possible_via_stations,
         get_trains_at_station,
@@ -20,6 +21,8 @@ try:
         get_nearby_station_codes,
         nearby_station_labels,
         station_label,
+        get_data_stats,
+        TRAIN_TYPE_OPTIONS,
         WEEKDAYS,
     )
     from live_availability import (
@@ -73,6 +76,41 @@ if "conn_directs" not in st.session_state:
     st.session_state.conn_directs = None
 if "qp_bootstrapped" not in st.session_state:
     st.session_state.qp_bootstrapped = False
+if "saved_searches" not in st.session_state:
+    st.session_state.saved_searches = []
+if "two_change_results" not in st.session_state:
+    st.session_state.two_change_results = None
+
+
+def remember_search(meta: dict):
+    """Keep the last 5 connection searches for one-click replay."""
+    entry = {
+        "start_station": meta.get("start_station"),
+        "end_station": meta.get("end_station"),
+        "s_code": meta.get("s_code"),
+        "e_code": meta.get("e_code"),
+        "search_date": meta.get("search_date"),
+        "flexible": bool(meta.get("flexible")),
+        "include_nearby": bool(meta.get("include_nearby")),
+        "pref_classes": list(meta.get("pref_classes") or []),
+        "train_types": list(meta.get("train_types") or []),
+        "quota": meta.get("quota") or "GN",
+        "allow_two_change": bool(meta.get("allow_two_change")),
+        "label": (
+            f"{meta.get('s_code', '?')} → {meta.get('e_code', '?')}"
+            + (f" · {meta['search_date'].isoformat()}" if meta.get("search_date") else "")
+        ),
+    }
+    existing = [
+        s
+        for s in st.session_state.saved_searches
+        if not (
+            s.get("s_code") == entry["s_code"]
+            and s.get("e_code") == entry["e_code"]
+            and s.get("search_date") == entry["search_date"]
+        )
+    ]
+    st.session_state.saved_searches = ([entry] + existing)[:5]
 
 
 def _label_for_code(code: str) -> str:
@@ -1087,6 +1125,22 @@ def render_connection_cards(
                     "(because of wait time or overnight)."
                 )
 
+            warning = str(row.get("Change_Warning") or "").strip()
+            if warning:
+                st.warning(warning)
+
+            types_line = []
+            if row.get("Train_1_Type"):
+                types_line.append(f"T1: {row['Train_1_Type']}")
+            if row.get("Train_2_Type"):
+                types_line.append(f"T2: {row['Train_2_Type']}")
+            if row.get("Train_1_Halt_Min") is not None and pd.notna(row.get("Train_1_Halt_Min")):
+                types_line.append(f"T1 halt {int(row['Train_1_Halt_Min'])}m")
+            if row.get("Train_2_Halt_Min") is not None and pd.notna(row.get("Train_2_Halt_Min")):
+                types_line.append(f"T2 halt {int(row['Train_2_Halt_Min'])}m")
+            if types_line:
+                st.caption(" · ".join(types_line))
+
             board_date = _parse_board_date(row) or search_date
             leg_start = extract_code(str(row.get("Start_From") or "")) or start_code
             leg_end = extract_code(str(row.get("End_At") or "")) or end_code
@@ -1159,6 +1213,58 @@ def render_connection_cards(
                 )
 
 
+def render_two_change_cards(results: pd.DataFrame, start_label: str, end_label: str, limit: int = 8):
+    """Display optional 2-change (3-train) itineraries."""
+    if results is None or results.empty:
+        return
+    st.subheader("2-change options")
+    st.caption(
+        f"Showing top {min(limit, len(results))} of {len(results)}. "
+        "These use two mid-stations (three trains). Seat check is per leg on IRCTC."
+    )
+    for i, (_, row) in enumerate(results.head(limit).iterrows()):
+        title = (
+            f"#{i + 1} · {row['Via_Station']} · "
+            f"{format_duration(row['Total_Hrs'])} total · "
+            f"waits {format_duration(row['Layover1_Hrs'])}+{format_duration(row['Layover2_Hrs'])}"
+        )
+        with st.expander(title, expanded=(i < 1)):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total", format_duration(row["Total_Hrs"]))
+            c2.metric("Wait 1", format_duration(row["Layover1_Hrs"]))
+            c3.metric("Wait 2", format_duration(row["Layover2_Hrs"]))
+            c4.metric("Changes", 2)
+            board_on = row.get("Board_On") or ""
+            st.markdown(
+                f"""
+                <div class="tc-route-box">
+                  <div class="tc-muted" style="margin-bottom:6px;">
+                    {start_label} → <b>{row.get('Via_Station','')}</b> → {end_label}
+                    {f" · Board <b>{board_on}</b>" if board_on else ""}
+                  </div>
+                  <div style="font-size:14px; display:flex; flex-direction:column; gap:10px;">
+                    <div><span class="tc-muted">TRAIN 1 · {row['Train_1_No']}</span>
+                      <b> {row['Train_1_Name']}</b> ({row.get('Train_1_Type','')})
+                      · {row['Leave_Start']} → {row['Arrive_Mid']}
+                      <span class="tc-muted">({format_duration(row['Leg1_Hrs'])})</span></div>
+                    <div><span class="tc-muted">TRAIN 2 · {row['Train_2_No']}</span>
+                      <b> {row['Train_2_Name']}</b> ({row.get('Train_2_Type','')})
+                      · {row['Leave_Mid']} → {row['Arrive_Via2']}
+                      <span class="tc-muted">({format_duration(row['Leg2_Hrs'])})</span></div>
+                    <div><span class="tc-muted">TRAIN 3 · {row['Train_3_No']}</span>
+                      <b> {row['Train_3_Name']}</b> ({row.get('Train_3_Type','')})
+                      · {row['Leave_Via2']} → {row['Arrive_End']}
+                      <span class="tc-muted">({format_duration(row['Leg3_Hrs'])})</span></div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            warn = str(row.get("Change_Warning") or "").strip()
+            if warn:
+                st.warning(warn)
+
+
 @st.cache_data(show_spinner=False)
 def cached_via_options(start_code, end_code, include_nearby=False):
     return get_possible_via_stations(start_code, end_code, include_nearby=include_nearby)
@@ -1209,12 +1315,13 @@ with head_r:
         st.rerun()
     st.caption("Switch theme anytime.")
 
-tab_connect, tab_direct, tab_station, tab_lookup = st.tabs(
+tab_connect, tab_direct, tab_station, tab_lookup, tab_about = st.tabs(
     [
         "Find Connections",
         "Direct Trains",
         "Station Explorer",
         "Train Lookup",
+        "About / Data",
     ]
 )
 
@@ -1222,6 +1329,33 @@ tab_connect, tab_direct, tab_station, tab_lookup = st.tabs(
 # TAB 1: FIND CONNECTIONS
 # =====================================================================================
 with tab_connect:
+    # Recent searches
+    if st.session_state.saved_searches:
+        st.caption("Recent searches")
+        cols = st.columns(min(5, len(st.session_state.saved_searches)))
+        for i, saved in enumerate(st.session_state.saved_searches):
+            with cols[i]:
+                if st.button(
+                    saved.get("label") or f"Search {i+1}",
+                    key=f"saved_search_{i}",
+                    use_container_width=True,
+                ):
+                    st.session_state.swap_tick += 1
+                    tick = st.session_state.swap_tick
+                    st.session_state[f"start_{tick}"] = saved.get("start_station") or ""
+                    st.session_state[f"end_{tick}"] = saved.get("end_station") or ""
+                    if saved.get("search_date"):
+                        st.session_state["conn_use_date"] = True
+                        st.session_state["conn_travel_date"] = saved["search_date"]
+                    st.session_state["conn_flex_on"] = bool(saved.get("flexible"))
+                    st.session_state["conn_nearby"] = bool(saved.get("include_nearby"))
+                    st.session_state["conn_pref_classes"] = list(saved.get("pref_classes") or [])
+                    st.session_state["conn_train_types"] = list(saved.get("train_types") or [])
+                    st.session_state["conn_two_change"] = bool(saved.get("allow_two_change"))
+                    if saved.get("quota"):
+                        st.session_state["conn_quota"] = saved["quota"]
+                    st.rerun()
+
     col1, col_swap, col2 = st.columns([5, 1, 5])
     with col1:
         start_station = st.selectbox(
@@ -1357,6 +1491,23 @@ with tab_connect:
                         index=0,
                     )
 
+            prefer_via = st.multiselect(
+                "Prefer these hubs (soft pin)",
+                options=station_list,
+                default=[],
+                key="conn_prefer_via",
+                help="Boost routes that change at these stations when available.",
+                max_selections=5,
+            )
+            avoid_via = st.multiselect(
+                "Avoid changing at",
+                options=station_list,
+                default=[],
+                key="conn_avoid_via",
+                help="Never show connections that interchange at these stations.",
+                max_selections=8,
+            )
+
         with col4:
             use_max_wait = st.checkbox(
                 "Set waiting time range",
@@ -1370,6 +1521,19 @@ with tab_connect:
                     max_value=24,
                     value=(1, 8),
                 )
+            train_types = st.multiselect(
+                "Train types (both legs must match)",
+                options=TRAIN_TYPE_OPTIONS,
+                default=[],
+                key="conn_train_types",
+                help="e.g. select Express + Vande Bharat + Rajdhani to allow those mixes.",
+            )
+            allow_two_change = st.toggle(
+                "Also search 2-change routes",
+                value=False,
+                key="conn_two_change",
+                help="Optional slower search: start → hub1 → hub2 → end (3 trains).",
+            )
 
         col5, col6 = st.columns(2)
         with col5:
@@ -1446,6 +1610,8 @@ with tab_connect:
                 s_code = extract_code(start_station)
                 e_code = extract_code(end_station)
                 v_code = extract_code(via_station) if use_via and via_station else None
+                prefer_codes = [extract_code(x) for x in (prefer_via or []) if extract_code(x)]
+                avoid_codes = [extract_code(x) for x in (avoid_via or []) if extract_code(x)]
 
                 directs = find_direct_trains(
                     s_code,
@@ -1453,6 +1619,7 @@ with tab_connect:
                     search_date=search_date,
                     flexible_days=conn_flex,
                     include_nearby=include_nearby,
+                    train_types=train_types or None,
                 )
                 results = find_connections_pro(
                     start_code=s_code,
@@ -1470,7 +1637,26 @@ with tab_connect:
                     sort_by=engine_sort,
                     exclude_overnight=exclude_overnight,
                     max_results=int(max_results),
+                    train_types=train_types or None,
+                    avoid_via_codes=avoid_codes or None,
+                    prefer_via_codes=prefer_codes or None,
                 )
+                two_change = None
+                if allow_two_change:
+                    two_change = find_two_change_connections(
+                        start_code=s_code,
+                        end_code=e_code,
+                        min_layover_hrs=max(0.5, float(min_wait)),
+                        max_layover_hrs=min(12.0, float(max_wait)),
+                        search_date=search_date,
+                        flexible_days=conn_flex,
+                        include_nearby=include_nearby,
+                        train_types=train_types or None,
+                        avoid_via_codes=avoid_codes or None,
+                        hub_limit=8,
+                        max_results=25,
+                        sort_by=engine_sort,
+                    )
 
             meta = {
                 "start_station": start_station,
@@ -1482,8 +1668,10 @@ with tab_connect:
                 "view_mode": view_mode,
                 "sort_by": sort_by,
                 "pref_classes": list(pref_classes or []),
+                "train_types": list(train_types or []),
                 "include_nearby": bool(include_nearby),
                 "flexible": bool(conn_flex),
+                "allow_two_change": bool(allow_two_change),
                 "direct_count": 0 if directs is None or directs.empty else len(directs),
             }
             st.session_state.conn_results = results
@@ -1491,17 +1679,22 @@ with tab_connect:
             st.session_state.conn_directs = (
                 None if directs is None or directs.empty else directs
             )
+            st.session_state.two_change_results = (
+                None if two_change is None or two_change.empty else two_change
+            )
             st.session_state.show_direct_from_conn = False
             st.session_state.seat_cache = {}
             st.session_state.direct_seat_cache = {}
             update_search_query_params(meta)
+            remember_search(meta)
 
     meta = st.session_state.conn_meta or {}
     results = st.session_state.conn_results
+    two_change = st.session_state.two_change_results
     pref_classes_meta = meta.get("pref_classes") or pref_classes or []
     sort_by_meta = meta.get("sort_by") or "fastest"
 
-    if results is not None:
+    if results is not None or two_change is not None:
         if meta.get("direct_count"):
             st.info(
                 f"**{meta['direct_count']} direct train(s)** also run between these stations "
@@ -1550,14 +1743,14 @@ with tab_connect:
                 )
                 st.caption("Tip: the same search is also saved under the **Direct Trains** tab.")
 
-        if results.empty:
+        if results is not None and results.empty and (two_change is None or two_change.empty):
             st.warning(
                 "No connections found matching your filters. "
                 "Try widening the wait time, allowing overnight waits, "
                 "turning on nearby stations / flexible dates, "
-                "or clearing time/date filters."
+                "adding more train types, or clearing time/date filters."
             )
-        else:
+        elif results is not None and not results.empty:
             # Refresh seat scores from cache, then sort
             results = apply_seat_scores_to_results(
                 results,
@@ -1570,7 +1763,7 @@ with tab_connect:
             results = sort_results_df(results, sort_by_meta)
             st.session_state.conn_results = results
 
-            st.success(f"Found {len(results)} optimized connection(s)!")
+            st.success(f"Found {len(results)} one-change connection(s)!")
 
             fastest_time = results["Total_Hrs"].min()
             best_layover = results["Layover_Hrs"].min()
@@ -1754,8 +1947,34 @@ with tab_connect:
                         "Est_Fare": st.column_config.NumberColumn(
                             "Est. fare (₹)", format="%.0f"
                         ),
+                        "Change_Warning": st.column_config.TextColumn("Change warning"),
+                        "Train_1_Type": st.column_config.TextColumn("T1 type"),
+                        "Train_2_Type": st.column_config.TextColumn("T2 type"),
                     },
                 )
+
+        if two_change is not None and not two_change.empty:
+            st.success(f"Found {len(two_change)} two-change route(s).")
+            st.download_button(
+                "Download 2-change CSV",
+                data=two_change.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    f"two_change_{meta.get('s_code', 'from')}_"
+                    f"{meta.get('e_code', 'to')}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="two_change_csv_dl",
+            )
+            render_two_change_cards(
+                two_change,
+                meta.get("start_station") or "",
+                meta.get("end_station") or "",
+            )
+            with st.expander("2-change results table"):
+                st.dataframe(two_change, use_container_width=True, hide_index=True)
+        elif meta.get("allow_two_change") and (two_change is None or two_change.empty):
+            st.caption("No 2-change routes found within the hub / wait limits.")
 
 # =====================================================================================
 # TAB 2: DIRECT TRAINS
@@ -1826,6 +2045,12 @@ with tab_direct:
             options=TRAVEL_CLASSES,
             key="direct_pref_classes",
         )
+        d_train_types = st.multiselect(
+            "Train types",
+            options=TRAIN_TYPE_OPTIONS,
+            key="direct_train_types",
+            help="Only show trains of these types.",
+        )
 
     if st.button("Search direct trains", type="primary", use_container_width=True, key="direct_btn"):
         if not d_start or not d_end:
@@ -1840,6 +2065,7 @@ with tab_direct:
                     search_date=d_date,
                     flexible_days=d_flex if d_use_date else 0,
                     include_nearby=d_nearby,
+                    train_types=d_train_types or None,
                     sort_by=d_sort_by,
                 )
             st.session_state.direct_results = directs
@@ -1980,6 +2206,81 @@ with tab_lookup:
                     "Halt (min)": st.column_config.NumberColumn("Halt (min)", format="%.0f min"),
                 },
             )
+            # Highlight very short halts
+            if not schedule.empty and "Halt (min)" in schedule.columns:
+                short = schedule[schedule["Halt (min)"] <= 2]
+                if not short.empty:
+                    bits = [
+                        f"{r['Station']} ({int(r['Halt (min)'])}m)"
+                        for _, r in short.iterrows()
+                    ]
+                    st.caption("Short halts (≤2 min): " + ", ".join(bits[:12]))
+
+# =====================================================================================
+# TAB 5: ABOUT / DATA
+# =====================================================================================
+with tab_about:
+    st.subheader("About Train Connector")
+    st.markdown(
+        """
+        Plan **direct** and **connecting** journeys on Indian Railways schedules,
+        then check live seats for both legs of a change.
+
+        This is a planning aid — always confirm on IRCTC before booking.
+        """
+    )
+    stats = get_data_stats()
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Trains in schedule", f"{stats['trains']:,}")
+    a2.metric("Schedule rows", f"{stats['schedule_rows']:,}")
+    a3.metric("Stations (schedule)", f"{stats['stations_in_schedule']:,}")
+    a4.metric("Stations (master)", f"{stats['stations_master']:,}")
+
+    b1, b2 = st.columns(2)
+    b1.metric("Running-days known", f"{stats['running_days_known']:,}")
+    b2.metric("Running-days unknown / assumed", f"{stats['running_days_unknown']:,}")
+
+    st.markdown("#### Train types in this dataset")
+    type_df = pd.DataFrame(
+        [{"Type": k, "Trains": v} for k, v in (stats.get("train_types") or {}).items()]
+    )
+    if not type_df.empty:
+        st.dataframe(type_df, use_container_width=True, hide_index=True)
+
+    from pathlib import Path
+
+    st.markdown("#### Data files")
+    data_files = [
+        "stations.csv",
+        "train_schedule_scrapped.csv",
+        "running_days_scrapped.csv",
+    ]
+    rows = []
+    for name in data_files:
+        p = Path(name)
+        if p.exists():
+            mtime = datetime.datetime.fromtimestamp(p.stat().st_mtime)
+            rows.append(
+                {
+                    "File": name,
+                    "Size": f"{p.stat().st_size / 1024:.1f} KB",
+                    "Last modified": mtime.strftime("%Y-%m-%d %H:%M"),
+                }
+            )
+        else:
+            rows.append({"File": name, "Size": "—", "Last modified": "missing"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown(
+        """
+        #### Caveats
+        - Schedules are **scraped / offline** and may be incomplete or out of date.
+        - Missing running-day bits are treated as **daily**.
+        - **2-change** search uses a capped hub set (fast, not exhaustive).
+        - Seat availability uses ConfirmTkt (unofficial) — verify on IRCTC.
+        - Short platform halts (≤2–5 min) are flagged as tight changes.
+        """
+    )
 
 st.markdown("---")
 st.info(
@@ -1988,6 +2289,8 @@ st.info(
 - If running-day data is missing, the train is treated as running every day.
 - **Nearby stations** expand major metros (Delhi, Mumbai, Kolkata, Chennai, Bengaluru, Hyderabad).
 - **Preferred class** filters seat pills and powers Best seats / Cheapest sorting after a seat check.
+- **Train types / avoid-via / 2-change** live under Advanced filters.
+- Recent searches appear above the station pickers (last 5).
 - Share a search with query params like `?from=NDLS&to=HWH&date=2026-08-25&nearby=1&class=3A,SL`.
 - Seat info comes from ConfirmTkt — always confirm on IRCTC before booking.
 - Prices and seats can change; this app is only for planning.
