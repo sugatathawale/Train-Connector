@@ -34,6 +34,16 @@ try:
         score_connection_seats,
         TRAVEL_CLASSES,
     )
+    from live_status import (
+        check_connection_pair_status,
+    )
+    from geo import (
+        connection_map_points,
+        two_change_map_points,
+        schedule_map_points,
+        coords_coverage_stats,
+        get_station_coords,
+    )
 except FileNotFoundError as e:
     st.set_page_config(page_title="Train Connector", layout="wide")
     st.error(
@@ -80,6 +90,10 @@ if "saved_searches" not in st.session_state:
     st.session_state.saved_searches = []
 if "two_change_results" not in st.session_state:
     st.session_state.two_change_results = None
+if "delay_cache" not in st.session_state:
+    st.session_state.delay_cache = {}
+if "map_route" not in st.session_state:
+    st.session_state.map_route = None
 
 
 def remember_search(meta: dict):
@@ -769,6 +783,159 @@ def render_running_day_badges(bits: str, dark: bool):
         st.caption("No running-day data on file — assumed to run daily.")
 
 
+def render_live_status_block(payload: dict, title: str):
+    if not payload:
+        return
+    if not payload.get("ok"):
+        st.warning(payload.get("error") or "Live status unavailable")
+        return
+    delay = int(payload.get("delay_mins") or 0)
+    delay_txt = "On time" if delay == 0 else (f"{delay} min late" if delay > 0 else f"{abs(delay)} min early")
+    st.markdown(f"**{title}** · `{payload.get('train_number', '')}` {payload.get('train_name', '')}")
+    st.caption(
+        f"{delay_txt}"
+        + (f" · {payload.get('position')}" if payload.get("position") else "")
+        + (f" · Updated {payload.get('last_update')}" if payload.get("last_update") else "")
+        + " · Source: NTES"
+    )
+
+
+def render_route_map(points: pd.DataFrame, caption: str = ""):
+    """Draw Start → Via → End as a connected path (pydeck), not isolated dots."""
+    if points is None or points.empty or len(points) < 2:
+        st.caption("Map unavailable — missing coordinates for one or more stations.")
+        return
+    if caption:
+        st.caption(caption)
+
+    plot = points.copy().reset_index(drop=True)
+    plot["lat"] = pd.to_numeric(plot["lat"], errors="coerce")
+    plot["lon"] = pd.to_numeric(plot["lon"], errors="coerce")
+    plot = plot.dropna(subset=["lat", "lon"])
+    if len(plot) < 2:
+        st.caption("Map unavailable — missing coordinates for one or more stations.")
+        return
+
+    plot["label"] = [
+        f"{row.role} · {row.code}" if str(getattr(row, "role", "") or "").strip() else str(row.code)
+        for row in plot.itertuples()
+    ]
+    # Sit text slightly above markers
+    plot["text_lat"] = plot["lat"] + max(0.25, (plot["lat"].max() - plot["lat"].min()) * 0.04)
+
+    path_coords = [[float(r.lon), float(r.lat)] for r in plot.itertuples()]
+    path_data = [{"path": path_coords, "name": caption or "route"}]
+
+    lat_min, lat_max = float(plot["lat"].min()), float(plot["lat"].max())
+    lon_min, lon_max = float(plot["lon"].min()), float(plot["lon"].max())
+    lat_c = (lat_min + lat_max) / 2
+    lon_c = (lon_min + lon_max) / 2
+    span = max(lat_max - lat_min, lon_max - lon_min, 0.5)
+    if span > 15:
+        zoom = 4
+    elif span > 8:
+        zoom = 5
+    elif span > 4:
+        zoom = 6
+    elif span > 2:
+        zoom = 7
+    else:
+        zoom = 8
+
+    try:
+        import pydeck as pdk
+
+        layers = [
+            pdk.Layer(
+                "PathLayer",
+                data=path_data,
+                get_path="path",
+                get_width=6,
+                get_color=[56, 189, 248],
+                width_min_pixels=4,
+                rounded=True,
+            ),
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=plot,
+                get_position="[lon, lat]",
+                get_radius=55000,
+                radius_min_pixels=8,
+                radius_max_pixels=18,
+                get_fill_color=[248, 113, 113],
+                get_line_color=[15, 23, 42],
+                line_width_min_pixels=1,
+                stroked=True,
+                pickable=True,
+            ),
+            pdk.Layer(
+                "TextLayer",
+                data=plot,
+                get_position="[lon, text_lat]",
+                get_text="label",
+                get_size=13,
+                get_color=[248, 250, 252],
+                get_text_anchor="'middle'",
+                get_alignment_baseline="'bottom'",
+                billboard=True,
+            ),
+        ]
+        deck = pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(
+                latitude=lat_c,
+                longitude=lon_c,
+                zoom=zoom,
+                pitch=0,
+                bearing=0,
+            ),
+            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+            tooltip={"text": "{label}\n{name}"},
+        )
+        st.pydeck_chart(deck, use_container_width=True, height=420)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Path map unavailable ({exc}). Showing station pins only.")
+        st.map(
+            plot[["lat", "lon"]].rename(columns={"lat": "latitude", "lon": "longitude"}),
+            size=80,
+            zoom=zoom,
+        )
+
+    labels = " → ".join(f"{r.role}: {r.code}" for r in plot.itertuples())
+    st.caption(labels)
+
+
+def _journey_day_at_start_for_train(train_no: str, start_code: str) -> int:
+    """Best-effort schedule day at boarding station for NTES origin-date math."""
+    try:
+        from engine import df2
+
+        rows = df2[
+            (df2["train_number"] == str(train_no))
+            & (df2["station_code"] == str(start_code).upper())
+        ]
+        if rows.empty:
+            return 1
+        return int(rows.iloc[0]["day"] or 1)
+    except Exception:
+        return 1
+
+
+def _journey_day_at_mid_for_train(train_no: str, via_code: str) -> int:
+    try:
+        from engine import df2
+
+        rows = df2[
+            (df2["train_number"] == str(train_no))
+            & (df2["station_code"] == str(via_code).upper())
+        ]
+        if rows.empty:
+            return 1
+        return int(rows.iloc[0]["day"] or 1)
+    except Exception:
+        return 1
+
+
 def _parse_board_date(row) -> Optional[datetime.date]:
     iso = str(row.get("Board_Date") or "").strip()
     if iso:
@@ -1212,8 +1379,94 @@ def render_connection_cards(
                     "Seat info is live from ConfirmTkt. Always confirm on IRCTC before booking."
                 )
 
+            # Live delay risk + map
+            map_col, delay_col = st.columns(2)
+            with map_col:
+                if st.button(
+                    "Show route map",
+                    key=f"map_{i}_{row['Train_1_No']}_{row['Train_2_No']}",
+                    use_container_width=True,
+                ):
+                    pts = connection_map_points(
+                        leg_start,
+                        str(row["Via_Code"]),
+                        leg_end,
+                        start_label=str(row.get("Start_From") or start_label),
+                        via_label=str(row.get("Via_Station") or ""),
+                        end_label=str(row.get("End_At") or end_label),
+                    )
+                    st.session_state.map_route = {
+                        "key": cache_key,
+                        "points": pts,
+                        "caption": f"{start_label} → {row['Via_Station']} → {end_label}",
+                    }
+                    st.rerun()
+            with delay_col:
+                delay_disabled = board_date is None
+                if st.button(
+                    "Check delay / layover risk",
+                    key=f"delay_{i}_{row['Train_1_No']}_{row['Train_2_No']}",
+                    use_container_width=True,
+                    disabled=delay_disabled,
+                    help="Live NTES status for both trains; flags tight waits if Train 1 is late.",
+                ):
+                    with st.spinner("Fetching live running status from NTES…"):
+                        t1_day = _journey_day_at_start_for_train(str(row["Train_1_No"]), leg_start)
+                        t2_day = _journey_day_at_mid_for_train(str(row["Train_2_No"]), str(row["Via_Code"]))
+                        delay_payload = check_connection_pair_status(
+                            train1_no=str(row["Train_1_No"]),
+                            train2_no=str(row["Train_2_No"]),
+                            via_code=str(row["Via_Code"]),
+                            layover_hrs=float(row.get("Layover_Hrs") or 0),
+                            board_date=board_date,
+                            train1_start_day=t1_day,
+                            train2_day_offset=int(row.get("Train2_Day_Offset", 0) or 0),
+                            train2_mid_day=t2_day,
+                            buffer_mins=20,
+                        )
+                        st.session_state.delay_cache[cache_key] = delay_payload
+                    st.rerun()
+                if delay_disabled:
+                    st.caption("Needs a travel date for live status.")
 
-def render_two_change_cards(results: pd.DataFrame, start_label: str, end_label: str, limit: int = 8):
+            map_state = st.session_state.map_route
+            if map_state and map_state.get("key") == cache_key:
+                st.markdown("##### Route map")
+                render_route_map(map_state.get("points"), map_state.get("caption") or "")
+
+            delay_data = st.session_state.delay_cache.get(cache_key)
+            if delay_data:
+                st.markdown("##### Live running status (NTES)")
+                risk = delay_data.get("risk") or {}
+                level = risk.get("level")
+                if level == "missed":
+                    st.error(risk.get("label") or "High risk of missing the connection")
+                elif level == "risky":
+                    st.warning(risk.get("label") or "Risky layover given current delay")
+                elif level == "watch":
+                    st.info(risk.get("label") or "Watch the delay")
+                elif level == "ok":
+                    st.success(risk.get("label") or "Layover looks OK")
+                elif delay_data.get("error"):
+                    st.warning(delay_data.get("error"))
+                d1, d2 = st.columns(2)
+                with d1:
+                    render_live_status_block(delay_data.get("leg1") or {}, "Train 1 (arriving at via)")
+                with d2:
+                    render_live_status_block(delay_data.get("leg2") or {}, "Train 2 (leaving via)")
+                st.caption(
+                    "Delay data from NTES (unofficial client). Confirm on the official NTES / RailOne app."
+                )
+
+
+def render_two_change_cards(
+    results: pd.DataFrame,
+    start_label: str,
+    end_label: str,
+    limit: int = 8,
+    start_code: str = "",
+    end_code: str = "",
+):
     """Display optional 2-change (3-train) itineraries."""
     if results is None or results.empty:
         return
@@ -1263,6 +1516,26 @@ def render_two_change_cards(results: pd.DataFrame, start_label: str, end_label: 
             warn = str(row.get("Change_Warning") or "").strip()
             if warn:
                 st.warning(warn)
+            if st.button(
+                "Show 2-change map",
+                key=f"map2_{i}_{row['Train_1_No']}_{row['Train_2_No']}_{row['Train_3_No']}",
+                use_container_width=True,
+            ):
+                pts = two_change_map_points(
+                    start_code or extract_code(start_label) or "",
+                    str(row.get("Via1_Code") or ""),
+                    str(row.get("Via2_Code") or ""),
+                    end_code or extract_code(end_label) or "",
+                )
+                st.session_state.map_route = {
+                    "key": f"2c_{i}",
+                    "points": pts,
+                    "caption": f"2-change: {row.get('Via_Station', '')}",
+                }
+                st.rerun()
+            map_state = st.session_state.map_route
+            if map_state and map_state.get("key") == f"2c_{i}":
+                render_route_map(map_state.get("points"), map_state.get("caption") or "")
 
 
 @st.cache_data(show_spinner=False)
@@ -1300,7 +1573,8 @@ with head_l:
             <span class="tc-chip">Connections</span>
             <span class="tc-chip">Direct trains</span>
             <span class="tc-chip">Seat check</span>
-            <span class="tc-chip">Station explorer</span>
+            <span class="tc-chip">Delay risk</span>
+            <span class="tc-chip">Route map</span>
           </div>
         </div>
         """,
@@ -1685,6 +1959,8 @@ with tab_connect:
             st.session_state.show_direct_from_conn = False
             st.session_state.seat_cache = {}
             st.session_state.direct_seat_cache = {}
+            st.session_state.delay_cache = {}
+            st.session_state.map_route = None
             update_search_query_params(meta)
             remember_search(meta)
 
@@ -1970,6 +2246,8 @@ with tab_connect:
                 two_change,
                 meta.get("start_station") or "",
                 meta.get("end_station") or "",
+                start_code=meta.get("s_code") or "",
+                end_code=meta.get("e_code") or "",
             )
             with st.expander("2-change results table"):
                 st.dataframe(two_change, use_container_width=True, hide_index=True)
@@ -2216,6 +2494,11 @@ with tab_lookup:
                     ]
                     st.caption("Short halts (≤2 min): " + ", ".join(bits[:12]))
 
+            pts = schedule_map_points(selected_train_number, schedule)
+            if not pts.empty:
+                st.markdown("**Route map**")
+                render_route_map(pts, f"Train {selected_train_number} stop map ({len(pts)} stations with coords)")
+
 # =====================================================================================
 # TAB 5: ABOUT / DATA
 # =====================================================================================
@@ -2247,6 +2530,43 @@ with tab_about:
     if not type_df.empty:
         st.dataframe(type_df, use_container_width=True, hide_index=True)
 
+    st.markdown("#### Maps & coordinates")
+    cov = coords_coverage_stats()
+    st.write(
+        f"`station_coords.csv` has **{cov['stations_with_coords']:,}** stations "
+        "(from [datameet/railways](https://github.com/datameet/railways)). "
+        "Connection cards can plot Start → Via → End."
+    )
+    sample = get_station_coords("NDLS")
+    if sample:
+        st.caption(f"Example NDLS → lat {sample['lat']}, lon {sample['lon']}")
+
+    st.markdown("#### Live delays (NTES)")
+    st.markdown(
+        """
+        Running status uses the unofficial [`ntes-client`](https://pypi.org/project/ntes-client/)
+        against [NTES](https://enquiry.indianrail.gov.in/mntes).
+        There is **no official public API**. Delays are advisory — confirm on RailOne / NTES app.
+
+        Layover risk: if planned wait minus arriving delay &lt; **20 minutes**, the change is flagged risky.
+        """
+    )
+
+    st.markdown("#### Refresh timetable")
+    st.markdown(
+        """
+        See **[DATA.md](DATA.md)** for the full guide.
+
+        ```bash
+        pip install ntes-client
+        python scripts/refresh_timetable.py --trains 12301,12213 --dry-run
+        python scripts/refresh_timetable.py --trains 12301,12213 --merge
+        ```
+
+        Restart Streamlit after writing new CSVs so the engine reloads data.
+        """
+    )
+
     from pathlib import Path
 
     st.markdown("#### Data files")
@@ -2254,6 +2574,7 @@ with tab_about:
         "stations.csv",
         "train_schedule_scrapped.csv",
         "running_days_scrapped.csv",
+        "station_coords.csv",
     ]
     rows = []
     for name in data_files:
@@ -2290,10 +2611,11 @@ st.info(
 - **Nearby stations** expand major metros (Delhi, Mumbai, Kolkata, Chennai, Bengaluru, Hyderabad).
 - **Preferred class** filters seat pills and powers Best seats / Cheapest sorting after a seat check.
 - **Train types / avoid-via / 2-change** live under Advanced filters.
+- **Check delay / layover risk** uses NTES (unofficial) — confirm on the official app.
+- **Show route map** needs `station_coords.csv` (datameet).
+- Refresh schedules via `scripts/refresh_timetable.py` (see DATA.md).
 - Recent searches appear above the station pickers (last 5).
-- Share a search with query params like `?from=NDLS&to=HWH&date=2026-08-25&nearby=1&class=3A,SL`.
 - Seat info comes from ConfirmTkt — always confirm on IRCTC before booking.
-- Prices and seats can change; this app is only for planning.
 """
 )
 
